@@ -1,40 +1,30 @@
-# Statistical Thresholds
-ZERO_CUTOFF = 0.30
-ALPHA_SIGNIFICANCE = 0.9
-LOG2FC_CUTOFF = 1.0
-ADJ_P_CUTOFF = 0.051
-FDR_THRESHOLD = 0.25
-SHAPIRO_P_THRESHOLD = 0.05
+# Configuration settings for Inflammatory and RNA-seq analysis
 
-# Plot Settings
-PLOT_DPI = 300
-PLOT_WIDTH_SINGLE = 6
-PLOT_HEIGHT_SINGLE = 4
-PLOT_WIDTH_MULTI = 14
-PLOT_HEIGHT_MULTI = 8
-PLOT_FONT_BASE = 14
+# Statistical thresholds
+alpha_level <- 0.05  # Significance level
+beta_level <- 0.8     # Power level
 
-# File Paths
-PATH_DATA_RAW = 'path/to/data/raw'
-PATH_DATA_PROCESSED = 'path/to/data/processed'
-PATH_OUTPUT_FIGURES = 'path/to/output/figures'
-PATH_OUTPUT_TABLES = 'path/to/output/tables'
-PATH_R_FUNCTIONS = 'path/to/r/functions'
+# Color palettes
+color_palette_inflammatory <- c("#FF5733", "#33FF57", "#3357FF") # Example colors
+color_palette_rnaseq <- c("#C70039", "#900C3F", "#581845") # Example colors
 
-# Color Palettes for Exposures
-Eucalyptus = ['#e4f7e3', '#b2d6bb', '#80b08f', '#4c9265']
-Peat = ['#fce1e1', '#f9b7b7', '#f28b8b', '#e04646']
-Pine = ['#e0f7fa', '#86d6db', '#3bc3c3', '#009b99']
-Red_Oak = ['#f9e3d6', '#f19b8e', '#e06a59', '#b74e39']
+# LLOD reference data
+llod_reference <- list(
+  inflammatory = 10,  # Lower limit of detection for inflammatory markers
+  rnaseq = 5          # Lower limit of detection for RNA-seq
+)
 
-# Colors for Sex
-MALE_COLOR = '#1f77b4'
-FEMALE_COLOR = '#ff7f0e'
+# Plot settings
+plot_settings <- list(
+  xlim = c(0, 100),  # Set x-axis limits
+  ylim = c(0, 1),    # Set y-axis limits
+  point_size = 3,     # Size of points
+  line_width = 1.5    # Width of lines
+)
 
-# DEG Colors
-UP_COLOR = '#2ca02c'
-DOWN_COLOR = '#d62728'
-NO_COLOR = '#7f7f7f'
-
-# Complete LLOD Reference Data Frame for 29 Cytokines from the V-PLEX Human Cytokine Kit
-# LLOD reference data goes here (as dataframe structure or description)
+# File paths
+file_paths <- list(
+  data_inflammatory = "data/inflammatory_data.csv",
+  data_rnaseq = "data/rnaseq_data.csv",
+  output_directory = "results/"
+)
