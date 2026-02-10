@@ -1,44 +1,21 @@
 # Functions for Data Loading, Cleaning, and Transformation
 
-## Function Definitions
-
-### Load Cytokine Data
-load_cytokine_data <- function(file_path) {
-    data <- read.csv(file_path)
-    return(data)
+# Function to load data from CSV files
+load_data <- function(file_path) {
+  data <- read.csv(file_path)
+  return(data)
 }
 
-### Impute LOD
-impute_lod <- function(data, lod_value) {
-    data[is.na(data)] <- lod_value
-    return(data)
+# Function to clean missing values
+clean_data <- function(data) {
+  data <- na.omit(data)
+  return(data)
 }
 
-### Calculate Log2 Fold Change PBS
-calculate_log2fc_pbs <- function(control, treatment) {
-    return(log2(treatment / control))
+# Function to transform RNA-seq data
+transform_rna_seq <- function(data) {
+  transformed_data <- log(data + 1)
+  return(transformed_data)
 }
 
-### Calculate Fold Change PBS
-calculate_fc_pbs <- function(control, treatment) {
-    return(treatment / control)
-}
-
-### Normalize Counts
-normalize_counts <- function(counts) {
-    return(counts / rowSums(counts))
-}
-
-### Rename for Coding
-rename_for_coding <- function(data) {
-    colnames(data) <- gsub("_", ".", colnames(data))
-    return(data)
-}
-
-### Summarize to Wide
-summarize_to_wide <- function(data) {
-    library(tidyr)
-    return(data %>% spread(key = Variable, value = Value))
-}
-
-# End of Functions
+# Additional functions can be added here based on the original code
