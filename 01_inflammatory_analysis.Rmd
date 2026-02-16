@@ -1,0 +1,659 @@
+---
+title: "hBEC Inflammatory Response Analysis (MSD, LDH, TEER)"
+author: "MJR"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: journal
+knit: (function(input, ...) {
+    rmarkdown::render(
+      input,
+      output_dir = "../output/reports",
+      knit_root_dir = ".."
+    )
+  })
+---
+
+# Setup & Configuration
+
+## Load Libraries & Functions
+
+```{r setup, include=FALSE}
+# Set root to project directory (one level up from analysis/)
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r load-config}
+# Source all configuration and function definitions
+source("R/_load_all.R")
+
+# Additional libraries specific to this analysis
+library(arsenal)
+library(rstatix)
+library(lme4)
+library(emmeans)
+library(ARTool)
+```
+
+# Data Loading & Preparation
+
+## Load Raw Data Files
+
+```{r load-raw-data}
+# Load cytokine data (LDH & TEER)
+data_ldh_teer_raw <- read_csv(here::here(PATH_DATA_RAW, "2023_LDHTEER_MJR1-191_4H.csv"))
+
+# Load MSD cytokine panel
+data_msd_raw <- read_csv(here::here(PATH_DATA_RAW, "2023_FS_MSD_MJR_NEW.csv"))
+
+# Load IL8 ELISA data
+data_il8_raw <- read_csv(here::here(PATH_DATA_RAW, "20231006_IL8_MJR96_191_4H.csv"))
+
+# Load metadata
+metadata_samples <- read_csv(here::here(PATH_DATA_RAW, "2023_MJR1_191_metadata.csv"))
+
+cat("✓ Raw data loaded\n")
+```
+
+## Clean & Prepare Data
+
+```{r prepare-data}
+# Convert LDH to numeric first
+data_ldh_teer_raw$LDH <- as.numeric(data_ldh_teer_raw$LDH)
+
+# Remove only rows where LDH is NA (not all NAs)
+data_ldh_teer <- data_ldh_teer_raw %>%
+  filter(!is.na(LDH))  # Only remove rows with missing LDH values
+
+cat("✓ Data cleaned\n")
+cat("  - Rows kept:", nrow(data_ldh_teer), "\n")
+cat("  - LDH values:", sum(!is.na(data_ldh_teer$LDH)), "\n")
+
+# Average duplicates
+data_ldh_teer_avg <- data_ldh_teer %>%
+  group_by(PATIENTCODE, CELLTYPE, EXPOSURE, TIMEPOINT, SEX, GROUP, CONCENTRATION) %>%
+  summarise(
+    LDH = mean(LDH, na.rm = TRUE),
+    TEERPRE = mean(TEERPRE, na.rm = TRUE),
+    TEERPOST = mean(TEERPOST, na.rm = TRUE),
+    TEERCHANGE = mean(TEERCHANGE, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("✓ Data averaged\n")
+cat("  - Final rows:", nrow(data_ldh_teer_avg), "\n")
+
+save_table(data_ldh_teer_avg, "ldh_teer_averaged.csv")
+```
+
+
+## Calculate LDH Cytotoxicity
+
+```{r calculate-cytotoxicity}
+# Calculate cytotoxicity percentage relative to positive control
+data_ldh_cytotox <- data_ldh_teer_avg %>% 
+  group_by(PATIENTCODE) %>% 
+  mutate(
+    Cytotox = (LDH - LDH[GROUP == "Control"]) / 
+              (LDH[GROUP == "Positive Control"] - LDH[GROUP == "Control"]) * 100
+  ) %>%
+  ungroup()
+
+cat("✓ Cytotoxicity calculated\n")
+cat("  - Mean cytotoxicity (PBS):", 
+    mean(data_ldh_cytotox$Cytotox[data_ldh_cytotox$EXPOSURE == "PBS Control"], na.rm = TRUE), "%\n")
+
+# Test normality
+shapiro_cytotox <- test_normality(data_ldh_cytotox$Cytotox)
+if (!is.na(shapiro_cytotox$p.value)) {
+  cat("  - Shapiro-Wilk p-value:", format(shapiro_cytotox$p.value, digits = 4), "\n")
+}
+
+# ============================================================================
+# Create summary table with Sex breakdown (All, M, F)
+# ============================================================================
+
+# Get mean ± SD by EXPOSURE and SEX
+summary_by_sex <- data_ldh_cytotox %>%
+  filter(EXPOSURE != "10X Lysis Buffer", EXPOSURE != "Untreated Control") %>%
+  group_by(EXPOSURE, SEX) %>%
+  summarise(
+    across(
+      c(Cytotox, LDH, TEERPRE, TEERPOST, TEERCHANGE),
+      list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE)),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+# Get mean ± SD for All (combined sexes)
+summary_all <- data_ldh_cytotox %>%
+  filter(EXPOSURE != "10X Lysis Buffer", EXPOSURE != "Untreated Control") %>%
+  group_by(EXPOSURE) %>%
+  summarise(
+    across(
+      c(Cytotox, LDH, TEERPRE, TEERPOST, TEERCHANGE),
+      list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE)),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(SEX = "All")
+
+# Combine both
+ldh_teer_summary_long <- bind_rows(summary_by_sex, summary_all)
+
+# Pivot longer and format as "mean ± sd"
+ldh_teer_summary <- ldh_teer_summary_long %>%
+  pivot_longer(
+    cols = -c(EXPOSURE, SEX),
+    names_to = c("Measurement", "Stat"),
+    names_sep = "_"
+  ) %>%
+  pivot_wider(
+    names_from = Stat,
+    values_from = value
+  ) %>%
+  mutate(
+    Value = sprintf("%.1f ± %.1f", mean, sd),
+    Measurement = paste0(Measurement, "_", SEX)
+  ) %>%
+  select(EXPOSURE, Measurement, Value) %>%
+  pivot_wider(
+    names_from = EXPOSURE,
+    values_from = Value
+  )
+
+# Save summary
+save_table(ldh_teer_summary, "LDH_TEER_summary.csv")
+
+cat("✓ LDH/TEER summary table saved\n")
+cat("  - Measurements:", nrow(ldh_teer_summary), "\n")
+cat("  - Groups (All, M, F) × Measures (Cytotox, LDH, TEER...)\n")
+
+# Show preview
+cat("\nPreview:\n")
+print(head(ldh_teer_summary, 10))
+```
+
+## Prepare MSD Data with LLOD Imputation
+
+```{r prepare-msd}
+# Merge metadata with MSD data
+data_msd_with_meta <- data_msd_raw %>%
+  left_join(metadata_samples, by = "SAMPLEID")
+
+# Impute values below LLOD
+imputation_result <- impute_lod(
+  input_data = data_msd_with_meta,
+  cols = NULL,
+  cytokine_llod = cytokine_llod,
+  zero_cutoff = ZERO_CUTOFF
+)
+
+data_msd_imputed <- imputation_result$data
+valid_cytokines <- imputation_result$valid_cytokines
+
+cat("✓ MSD data imputation complete\n")
+cat("  - Valid cytokines:", length(valid_cytokines), "\n")
+
+save_table(data_msd_imputed, "msd_cleaned.csv")
+```
+
+## Replace MSD IL-8 with ELISA IL-8 Data
+
+```{r il8-replacement}
+# Remove blank values from IL-8 data
+data_il8_clean <- data_il8_raw
+data_il8_clean[data_il8_clean == ""] <- NA
+data_il8_clean <- na.omit(data_il8_clean)
+
+# Average replicates for the same PATIENT and EXPOSURE
+data_il8_avg <- data_il8_clean %>%
+  group_by(PATIENTCODE, CELLTYPE, EXPOSURE, TIMEPOINT, SEX, GROUP, CONCENTRATION) %>%
+  summarize(
+    IL8 = mean(IL8, na.rm = TRUE),
+    SAMPLEID = {
+      # Extract numeric part from SAMPLE_ID
+      nums <- as.numeric(sub(".*_(\\d+)$", "\\1", SAMPLEID))
+      # Keep only even numbers
+      even_nums <- nums[nums %% 2 == 0]
+      # Pick the highest even number (or NA if none)
+      if(length(even_nums) > 0) {
+        SAMPLEID[which(nums == max(even_nums))[1]]
+      } else {
+        NA_character_
+      }
+    },
+    .groups = "drop"
+  )
+
+# Calculate fold change relative to PBS Control (if GROUP exists)
+if ("GROUP" %in% colnames(data_il8_avg)) {
+  data_il8_avg <- data_il8_avg %>%
+    group_by(PATIENTCODE) %>%
+    mutate(IL8_PBS = (IL8 - IL8[GROUP == "Control"]) / IL8[GROUP == "Control"]) %>%
+    ungroup()
+}
+
+# Remove IL8 from msd_imputed and add ELISA IL8
+il8_subset <- data_il8_avg %>%
+  ungroup() %>%
+  select(SAMPLEID, IL8)
+
+data_msd_imputed <- data_msd_imputed %>%
+  select(-IL8) %>%
+  left_join(il8_subset, by = "SAMPLEID")
+
+cat("✓ IL-8 ELISA data merged\n")
+cat("  - Rows with IL-8 data:", sum(!is.na(data_msd_imputed$IL8)), "\n")
+
+save_table(data_il8_avg, "il8_elisa_averaged.csv")
+```
+
+# Exploratory Analysis
+
+## Outlier Detection
+
+```{r detect-outliers}
+cat("Detecting outliers in PBS control samples...\n\n")
+
+# Select PBS control samples
+pbs_data <- data_msd_imputed %>%
+  filter(EXPOSURE == "PBS_Control") %>%
+  select(all_of(valid_cytokines[1:5]))
+
+outlier_results <- detect_outliers_grubbs(pbs_data)
+print(outlier_results)
+```
+
+## Normality Testing
+
+```{r test-normality}
+cat("Testing normality of key measurements...\n\n")
+
+# Test LDH
+shapiro_ldh <- test_normality(data_ldh_teer_avg$LDH)
+if (!is.na(shapiro_ldh$p.value)) {
+  cat("LDH - Shapiro-Wilk p-value:", format(shapiro_ldh$p.value, digits = 4), "\n")
+} else {
+  cat("LDH - Sample size too small for normality test\n")
+}
+
+# Test TEER change
+shapiro_teer <- test_normality(data_ldh_teer_avg$TEERCHANGE)
+if (!is.na(shapiro_teer$p.value)) {
+  cat("TEER Change - Shapiro-Wilk p-value:", format(shapiro_teer$p.value, digits = 4), "\n")
+} else {
+  cat("TEER Change - Sample size too small for normality test\n")
+}
+```
+
+# Statistical Testing
+
+## Prepare Data for Tests
+
+```{r prepare-for-stats}
+data_for_stats <- data_msd_imputed %>%
+  filter(EXPOSURE != "Untreated Control") %>%
+  mutate(
+    EXPOSURE = factor(EXPOSURE),
+    SEX = factor(SEX),
+    PATIENTCODE = factor(PATIENTCODE)
+  ) %>%
+  select(PATIENTCODE, SEX, EXPOSURE, all_of(valid_cytokines))
+
+cat("✓ Data prepared for statistical testing\n")
+```
+
+## Non-parametric Tests
+
+```{r nonparam-tests}
+cat("Running Nonparametric Tests by Group\n\n")
+
+# ===============================================================
+# 1. Run nonparametric pairwise tests for all groups
+# ===============================================================
+nonparametric_results_All <- nonparametric_pairwise(
+  data = data_for_stats,
+  group = "All",
+  adjust_method = "BH",
+  response_columns = valid_cytokines
+)
+
+nonparametric_results_F <- nonparametric_pairwise(
+  data = data_for_stats,
+  group = "F",
+  adjust_method = "BH",
+  response_columns = valid_cytokines
+)
+
+nonparametric_results_M <- nonparametric_pairwise(
+  data = data_for_stats,
+  group = "M",
+  adjust_method = "BH",
+  response_columns = valid_cytokines
+)
+
+# ===============================================================
+# 2. Run nonparametric tests for LDH / TEER measurements
+# ===============================================================
+LDH_TEER_results <- nonparametric_pairwise(
+  data = data_ldh_teer_avg,
+  group = "All",
+  response_columns = c("LDH", "TEERCHANGE")
+)
+
+cat("✓ Nonparametric tests complete\n")
+print(head(nonparametric_results_All, 10))
+```
+
+## Format Nonparametric Test Results
+
+```{r nonparametric-format-output}
+cat("Formatting Nonparametric Test Results\n\n")
+
+# Combine all nonparametric results
+nonparametric_all <- bind_rows(
+  nonparametric_results_All %>% mutate(group = "All"),
+  nonparametric_results_F %>% mutate(group = "F"),
+  nonparametric_results_M %>% mutate(group = "M")
+)
+
+# Write nonparametric results
+save_table(nonparametric_all, "nonparametric_cytokine_results.csv")
+save_table(LDH_TEER_results, "nonparametric_LDH_TEER_results.csv")
+
+cat("Nonparametric results saved.\n")
+print(head(nonparametric_all, 10))
+```
+
+## LMER with Treatment-vs-Control Contrasts
+
+```{r lmer-contrasts}
+cat("LMER Analysis with Treatment-vs-Control Contrasts (BH-FDR corrected)\n\n")
+
+# Run LMER contrasts
+lmer_significance <- exposure_lmer_pairwise(
+  data = data_for_stats, group = "All", adjust_method = "fdr",
+  response_columns = valid_cytokines, ctrl_level = "PBS Control"
+)
+
+lmer_F_significance <- exposure_lmer_pairwise(
+  data_for_stats, group = "F", adjust_method = "fdr",
+  response_columns = valid_cytokines, ctrl_level = "PBS Control"
+)
+
+lmer_M_significance <- exposure_lmer_pairwise(
+  data_for_stats, group = "M", adjust_method = "fdr",
+  response_columns = valid_cytokines, ctrl_level = "PBS Control"
+)
+
+# Combine results
+lmer_results_all <- bind_rows(lmer_significance, lmer_F_significance, lmer_M_significance)
+
+# Show significant results
+lmer_sig <- lmer_results_all %>%
+  filter(p.value < 0.05) %>%
+  arrange(p.value)
+
+print(head(lmer_sig, 20))
+save_table(lmer_results_all, "lmer_contrasts_all.csv")
+save_table(lmer_sig, "lmer_contrasts_significant.csv")
+```
+
+## Format LMER Results with Significance Stars and LLOD Check
+
+```{r lmer-format-output}
+cat("Formatting LMER Results with Significance Stars and LLOD Check\n\n")
+
+# Generate significance stars based on p-value
+stars_df_lmer <- lmer_results_all %>%
+  mutate(stars = case_when(
+    p.value < 0.001 & estimate > 0  ~ "***",
+    p.value < 0.001 & estimate < 0  ~ "###",
+    p.value < 0.01  & estimate > 0  ~ "**",
+    p.value < 0.01  & estimate < 0  ~ "##",
+    p.value < 0.05  & estimate > 0  ~ "*",
+    p.value < 0.05  & estimate < 0  ~ "#",
+    p.value < 0.1   & estimate != 0 ~ "~",
+    TRUE ~ ""
+  ))
+
+# Pivot stars to long format
+stars_long_lmer <- stars_df_lmer %>%
+  select(response, group, contrast, stars) %>%
+  mutate(
+    Measurement = response,
+    EXPOSURE = str_trim(gsub(" - PBS Control$", "", contrast))
+  ) %>%
+  select(Measurement, group, EXPOSURE, stars)
+
+# Get mean ± SD summary by exposure AND group
+msd_summary_by_group <- data_for_stats %>%
+  group_by(EXPOSURE, SEX) %>%
+  summarise(across(all_of(valid_cytokines),
+                   list(mean = ~mean(.x, na.rm = TRUE),
+                        sd = ~sd(.x, na.rm = TRUE)),
+                   .names = "{.col}_{.fn}"),
+            .groups = "drop") %>%
+  pivot_longer(cols = -c(EXPOSURE, SEX),
+               names_to = c("Measurement", "Stat"),
+               names_sep = "_",
+               values_to = "Value") %>%
+  pivot_wider(names_from = Stat,
+              values_from = Value) %>%
+  mutate(Value_full = sprintf("%.2f ± %.2f", mean, sd),
+         group = SEX) %>%
+  select(Measurement, group, EXPOSURE, Value_full)
+
+# Also get "All" combined results
+msd_summary_all <- data_for_stats %>%
+  group_by(EXPOSURE) %>%
+  summarise(across(all_of(valid_cytokines),
+                   list(mean = ~mean(.x, na.rm = TRUE),
+                        sd = ~sd(.x, na.rm = TRUE)),
+                   .names = "{.col}_{.fn}"),
+            .groups = "drop") %>%
+  pivot_longer(cols = -EXPOSURE,
+               names_to = c("Measurement", "Stat"),
+               names_sep = "_",
+               values_to = "Value") %>%
+  pivot_wider(names_from = Stat,
+              values_from = Value) %>%
+  mutate(Value_full = sprintf("%.2f ± %.2f", mean, sd),
+         group = "All") %>%
+  select(Measurement, group, EXPOSURE, Value_full)
+
+# Combine all groups
+msd_summary_wide <- bind_rows(msd_summary_by_group, msd_summary_all)
+
+# Merge stars and apply LLOD check
+combined_long_lmer <- msd_summary_wide %>%
+  left_join(stars_long_lmer, by = c("Measurement", "group", "EXPOSURE")) %>%
+  mutate(Analyte_Base = gsub("_.*", "", Measurement)) %>%
+  left_join(cytokine_llod, by = c("Analyte_Base" = "Analyte")) %>%
+  mutate(
+    Value_num = as.numeric(sub("^(\\d*\\.?\\d+).*", "\\1", Value_full)),
+    Value_final = ifelse(
+      !is.na(stars) & !is.na(Value_num) & Value_num >= LLOD,
+      paste0(Value_full, " ", stars),
+      Value_full
+    )
+  )
+
+# Pivot to wide format with group column
+combined_wide_lmer <- combined_long_lmer %>%
+  select(Measurement, group, EXPOSURE, Value_final) %>%
+  pivot_wider(names_from = EXPOSURE, values_from = Value_final) %>%
+  select(group, Measurement, `PBS Control`, everything())
+
+# Write single output CSV
+save_table(combined_wide_lmer, "MSD_hbec_lmer_with_significance.csv")
+
+cat("Output saved to: output/tables/MSD_hbec_lmer_with_significance.csv\n")
+print(head(combined_wide_lmer, 10))
+```
+
+## ART ANOVA with Treatment-vs-Control Contrasts
+
+```{r art-contrasts}
+cat("ART ANOVA (Sensitivity Analysis) with Treatment-vs-Control Contrasts\n\n")
+
+# Run ART ANOVA contrasts
+hbec_significance_art <- exposure_art_pairwise(
+  data_for_stats, group = "All", adjust_method = "fdr",
+  response_columns = valid_cytokines, ctrl_level = "PBS Control"
+)
+
+msd_F_significance_art <- exposure_art_pairwise(
+  data_for_stats, group = "F", adjust_method = "fdr",
+  response_columns = valid_cytokines, ctrl_level = "PBS Control"
+)
+
+msd_M_significance_art <- exposure_art_pairwise(
+  data_for_stats, group = "M", adjust_method = "fdr",
+  response_columns = valid_cytokines, ctrl_level = "PBS Control"
+)
+
+# Combine results
+art_results_all <- bind_rows(hbec_significance_art, msd_F_significance_art, msd_M_significance_art)
+
+# Show significant results
+art_sig <- art_results_all %>%
+  filter(p.value < 0.05) %>%
+  arrange(p.value)
+
+print(head(art_sig, 20))
+save_table(art_results_all, "art_contrasts_all.csv")
+save_table(art_sig, "art_contrasts_significant.csv")
+```
+
+## Format ART Results with Significance Stars and LLOD Check
+
+```{r art-format-output}
+cat("Formatting ART Results with Significance Stars and LLOD Check\n\n")
+
+# Generate significance stars based on p-value
+stars_df_art <- art_results_all %>%
+  mutate(stars = case_when(
+    p.value < 0.001 & estimate > 0  ~ "***",
+    p.value < 0.001 & estimate < 0  ~ "###",
+    p.value < 0.01  & estimate > 0  ~ "**",
+    p.value < 0.01  & estimate < 0  ~ "##",
+    p.value < 0.05  & estimate > 0  ~ "*",
+    p.value < 0.05  & estimate < 0  ~ "#",
+    p.value < 0.1   & estimate != 0 ~ "~",
+    TRUE ~ ""
+  ))
+
+# Pivot stars to long format
+stars_long_art <- stars_df_art %>%
+  select(response, group, contrast, stars) %>%
+  mutate(
+    Measurement = response,
+    EXPOSURE = str_trim(gsub(" - PBS Control$", "", contrast))
+  ) %>%
+  select(Measurement, group, EXPOSURE, stars)
+
+# Get mean ± SD summary by exposure AND group
+msd_summary_by_group_art <- data_for_stats %>%
+  group_by(EXPOSURE, SEX) %>%
+  summarise(across(all_of(valid_cytokines),
+                   list(mean = ~mean(.x, na.rm = TRUE),
+                        sd = ~sd(.x, na.rm = TRUE)),
+                   .names = "{.col}_{.fn}"),
+            .groups = "drop") %>%
+  pivot_longer(cols = -c(EXPOSURE, SEX),
+               names_to = c("Measurement", "Stat"),
+               names_sep = "_",
+               values_to = "Value") %>%
+  pivot_wider(names_from = Stat,
+              values_from = Value) %>%
+  mutate(Value_full = sprintf("%.2f ± %.2f", mean, sd),
+         group = SEX) %>%
+  select(Measurement, group, EXPOSURE, Value_full)
+
+# Also get "All" combined results
+msd_summary_all_art <- data_for_stats %>%
+  group_by(EXPOSURE) %>%
+  summarise(across(all_of(valid_cytokines),
+                   list(mean = ~mean(.x, na.rm = TRUE),
+                        sd = ~sd(.x, na.rm = TRUE)),
+                   .names = "{.col}_{.fn}"),
+            .groups = "drop") %>%
+  pivot_longer(cols = -EXPOSURE,
+               names_to = c("Measurement", "Stat"),
+               names_sep = "_",
+               values_to = "Value") %>%
+  pivot_wider(names_from = Stat,
+              values_from = Value) %>%
+  mutate(Value_full = sprintf("%.2f ± %.2f", mean, sd),
+         group = "All") %>%
+  select(Measurement, group, EXPOSURE, Value_full)
+
+# Combine all groups
+msd_summary_wide_art <- bind_rows(msd_summary_by_group_art, msd_summary_all_art)
+
+# Merge stars and apply LLOD check
+combined_long_art <- msd_summary_wide_art %>%
+  left_join(stars_long_art, by = c("Measurement", "group", "EXPOSURE")) %>%
+  mutate(Analyte_Base = gsub("_.*", "", Measurement)) %>%
+  left_join(cytokine_llod, by = c("Analyte_Base" = "Analyte")) %>%
+  mutate(
+    Value_num = as.numeric(sub("^(\\d*\\.?\\d+).*", "\\1", Value_full)),
+    Value_final = ifelse(
+      !is.na(stars) & !is.na(Value_num) & Value_num >= LLOD,
+      paste0(Value_full, " ", stars),
+      Value_full
+    )
+  )
+
+# Pivot to wide format with group column
+combined_wide_art <- combined_long_art %>%
+  select(Measurement, group, EXPOSURE, Value_final) %>%
+  pivot_wider(names_from = EXPOSURE, values_from = Value_final) %>%
+  select(group, Measurement, `PBS Control`, everything())
+
+# Write single output CSV
+save_table(combined_wide_art, "MSD_hbec_art_with_significance.csv")
+
+cat("Output saved to: output/tables/MSD_hbec_art_with_significance.csv\n")
+print(head(combined_wide_art, 10))
+```
+
+## Normality Testing: Transformation Assessment
+
+```{r transform-normality}
+cat("Testing normality of original, log10, and sqrt transformed data\n\n")
+
+# Test transformations for a few key cytokines
+transform_results <- data.frame()
+
+for (cyt in valid_cytokines[1:5]) {
+  result <- test_transformations(data_for_stats[[cyt]])
+  result$Cytokine <- cyt
+  transform_results <- rbind(transform_results, result)
+}
+
+print(transform_results)
+save_table(transform_results, "normality_transformation_assessment.csv")
+```
+
+# Summary & Outputs
+
+```{r session-summary}
+cat("\n")
+cat("═══════════���═════════════════════════════════════════════════\n")
+cat("  INFLAMMATORY ANALYSIS COMPLETE\n")
+cat("═════════════════════════════════════════════════════════════\n\n")
+
+cat("Output files saved to:\n")
+cat("  Figures:", file.path(getwd(), PATH_OUTPUT_FIGURES), "\n")
+cat("  Tables:", file.path(getwd(), PATH_OUTPUT_TABLES), "\n\n")
+
+sessionInfo()
+```

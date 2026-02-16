@@ -1,0 +1,1565 @@
+---
+title: "hBEC RNA-Seq Analysis"
+author: "MJR"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: journal
+knit: (function(input, ...) {
+    rmarkdown::render(
+      input,
+      output_dir = "../output/reports",
+      knit_root_dir = ".."
+    )
+  })
+---
+
+# Setup & Configuration
+
+## Load Libraries & Functions
+
+```{r setup, include=FALSE}
+# Set root to project directory (one level up from analysis/)
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Add this diagnostic chunk right after setup:
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  message = FALSE, 
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 8
+)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Set seed for reproducibility
+set.seed(4454)
+```
+
+```{r load-config}
+# Source all configuration and function definitions
+source("R/_load_all.R")
+
+# Additional libraries specific to RNA-seq analysis
+library(DESeq2)
+library(edgeR)
+library(statmod)
+library(variancePartition)
+library(BiocParallel)
+library(EnhancedVolcano)
+library(ComplexHeatmap)
+library(circlize)
+library(eulerr)
+library(ggrepel)
+library(rvest)
+library(factoextra)
+
+cat("✓ RNA-seq analysis environment loaded\n")
+```
+
+---
+
+# Data Loading & Preparation
+
+## Load Raw Data Files
+
+```{r load-raw-data}
+# Load raw counts
+raw_seq <- read_csv(here::here(PATH_DATA_RAW, "30_999361309_genes_v2.csv"))
+
+# Load metadata
+metadata_MJR1_191 <- read_csv(here::here(PATH_DATA_RAW, "2023_MJR1_191_metadata.csv"))
+
+# Subset MJR samples only
+mjr_seq <- raw_seq %>%
+  select(Geneid, starts_with("MJR")) %>%
+  rename_all(~gsub("MJR-", "MJR_", .))
+
+cat("✓ Raw data loaded\n")
+cat("  - Genes:", nrow(mjr_seq), "\n")
+cat("  - Samples:", ncol(mjr_seq) - 1, "\n")
+```
+
+## Filter Low-Abundance Genes
+
+```{r filter-genes}
+# Remove samples with 90% or more zeroes
+mjr_seq <- mjr_seq[, colMeans(mjr_seq != 0) > 0.1]
+
+# Apply background filtering using function
+mjr_seq_filtered <- filter_genes(mjr_seq, background_threshold = GENE_BACKGROUND_THRESHOLD)
+
+# Remove samples for incomplete donor (DD007T)
+drop_cols <- c("MJR_146", "MJR_148", "MJR_152", "MJR_154", "MJR_158", 
+               "MJR_160", "MJR_162", "MJR_164", "MJR_166")
+mjr_seq_filtered <- mjr_seq_filtered %>% select(-any_of(drop_cols))
+
+cat("✓ Gene filtering complete\n")
+cat("  - Retained:", nrow(mjr_seq_filtered), "genes\n")
+cat("  - Removed:", nrow(mjr_seq) - nrow(mjr_seq_filtered), "low-abundance genes\n")
+cat("  - Final sample count:", ncol(mjr_seq_filtered) - 1, "\n")
+```
+
+## Prepare Metadata
+
+```{r prepare-metadata}
+# Subset metadata to match filtered samples
+mjr_seq_samples <- colnames(mjr_seq_filtered)[-1]  # Exclude Geneid column
+
+meta_data_subset <- metadata_MJR1_191 %>%
+  filter(SAMPLEID %in% mjr_seq_samples) %>%
+  select(SAMPLEID, EXPOSURE, SEX, PATIENTCODE) %>%
+  mutate(
+    EXPOSURE = gsub(" ", "_", EXPOSURE),
+    EXPOSURE = gsub("Red_Oak_(5|25)", "RedOak_\\1", EXPOSURE),
+    EXPOSURE = factor(EXPOSURE, levels = unique(EXPOSURE)),
+    SEX = factor(SEX),
+    PATIENTCODE = factor(PATIENTCODE)
+  ) %>%
+  arrange(match(SAMPLEID, mjr_seq_samples))  # Match order to seq data
+
+# Set reference level
+meta_data_subset$EXPOSURE <- relevel(meta_data_subset$EXPOSURE, ref = "PBS_Control")
+
+cat("✓ Metadata prepared\n")
+cat("  - Samples:", nrow(meta_data_subset), "\n")
+cat("  - Exposures:", length(levels(meta_data_subset$EXPOSURE)), "\n")
+cat("  - Donors:", length(unique(meta_data_subset$PATIENTCODE)), "\n")
+```
+
+---
+
+# Quality Control & Exploratory Analysis
+
+## PCA Plot
+
+```{r pca-analysis, fig.width=10, fig.height=8}
+# Prepare data for PCA
+seq_transposed <- mjr_seq_filtered %>%
+  pivot_longer(cols = -Geneid, names_to = "Sample", values_to = "Expression") %>%
+  pivot_wider(names_from = Geneid, values_from = Expression) %>%
+  left_join(meta_data_subset, by = c("Sample" = "SAMPLEID")) %>%
+  column_to_rownames(var = "Sample")
+
+# Convert to matrix for normalization
+counts_matrix <- as.matrix(t(seq_transposed[, 1:(ncol(seq_transposed) - 3)]))
+
+# Create DGEList and normalize
+dataset <- DGEList(counts_matrix, group = seq_transposed$PATIENTCODE)
+dataset <- calcNormFactors(dataset)
+lcpm <- cpm(dataset, log = TRUE)
+
+# Run PCA
+pca_res <- prcomp(t(lcpm), center = TRUE, scale = TRUE)
+
+# Plot with factoextra
+fviz_pca_ind(
+  pca_res,
+  label = "none",
+  habillage = seq_transposed$EXPOSURE,
+  palette = color_exposure,
+  addEllipses = TRUE,
+  ellipse.type = 'convex'
+) +
+  ggtitle("PCA - Sample Clustering by Exposure") +
+  theme(
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    panel.border = element_rect(fill = NA, color = "black", size = 0.3),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank()
+  )
+
+save_plot("PCA_exposure_clustering.png", last_plot(), width = 10, height = 8)
+```
+
+## Sample Correlation Dendrogram
+
+```{r dendrogram, eval=TRUE}
+# Dendrogram analysis for sample QC
+# Set eval=TRUE to run this during full QC
+
+lcpm_combined <- as.data.frame(cbind(seq_transposed[, 1:2], t(lcpm)))
+exposure_list <- as.list(unique(as.character(lcpm_combined$EXPOSURE)))
+
+# Create dendrograms for each exposure group
+dendrograms <- lapply(exposure_list, function(exposure) {
+  tmp <- lcpm_combined %>% filter(EXPOSURE == exposure)
+  names <- rownames(tmp)
+  
+  tmp <- tmp %>%
+    select(-c(1:2)) %>%
+    sapply(as.numeric) %>%
+    as.data.frame(row.names = names)
+  
+  tmp_dend <- cor(t(tmp))
+  tmp_dend <- as.dendrogram(hclust(as.dist(1 - tmp_dend)))
+  
+  par(mar = c(4, 1, 1, 12))
+  plot(tmp_dend, main = as.character(exposure), horiz = TRUE) +
+    abline(v = 0.25, lty = 2)
+})
+
+cat("✓ Dendrogram analysis complete\n")
+```
+
+---
+
+# Normalization & Transformation
+
+## Normalize Counts
+
+```{r normalize-counts, cache=TRUE}
+# Median-of-ratios normalization
+counts_matrix <- as.matrix(mjr_seq_filtered[, -1]) + 1  # Add pseudocount
+
+normalized_counts <- normalize_counts(counts_matrix)
+normalized_counts <- as.data.frame(normalized_counts)
+normalized_counts$Geneid <- mjr_seq_filtered$Geneid
+
+# Reorder to put Geneid first
+normalized_counts <- normalized_counts[, c("Geneid", setdiff(names(normalized_counts), "Geneid"))]
+
+cat("✓ Median-of-ratios normalization complete\n")
+
+# Export
+write_csv(normalized_counts, here::here(PATH_DATA_PROCESSED, "MJR_seq_normalized.csv"))
+```
+
+## Variance Stabilizing Transformation
+
+```{r vst-transform, cache=TRUE}
+# Create DESeq2 object for VST
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_matrix,
+  colData = data.frame(condition = rep(1, ncol(counts_matrix))),
+  design = ~ 1
+)
+
+# Estimate size factors and apply VST
+dds <- estimateSizeFactors(dds)
+vst_counts <- vst(dds, blind = TRUE)
+vst_matrix <- assay(vst_counts)
+
+# Convert to data frame
+vst_counts_df <- as.data.frame(vst_matrix)
+vst_counts_df$Geneid <- mjr_seq_filtered$Geneid
+vst_counts_df <- vst_counts_df[, c("Geneid", setdiff(names(vst_counts_df), "Geneid"))]
+
+cat("✓ VST transformation complete\n")
+
+# Export
+write_csv(vst_counts_df, here::here(PATH_DATA_PROCESSED, "MJR_seq_vst.csv"))
+```
+
+---
+
+# Differential Expression Analysis
+
+**Note:** The following chunks perform heavy computation.  
+- Set `eval=TRUE` when ready to run the full DEG analysis  
+- Results are cached and saved to avoid re-running  
+
+## Prepare for DEG Analysis
+
+```{r prepare-deg-data}
+# Filter metadata: remove untreated controls and incomplete donor
+seq_degs <- seq_transposed %>%
+  filter(EXPOSURE != "Untreated_Control", PATIENTCODE != "DD007T")
+
+# Create proper count matrix (genes as rows, samples as columns)
+counts_for_deg <- as.matrix(t(seq_degs[, 1:(ncol(seq_degs) - 3)]))
+colnames(counts_for_deg) <- rownames(seq_degs)
+
+# Metadata for DEG analysis
+meta_deg <- seq_degs %>%
+  select(EXPOSURE, PATIENTCODE, SEX) %>%
+  mutate(
+    EXPOSURE = factor(EXPOSURE),
+    PATIENTCODE = factor(PATIENTCODE),
+    SEX = factor(SEX)
+  )
+
+# Create DGEList object
+dataset_MJR <- DGEList(counts_for_deg, group = meta_deg$EXPOSURE)
+
+cat("✓ Data prepared for DEG analysis\n")
+cat("  - Genes:", nrow(counts_for_deg), "\n")
+cat("  - Samples:", ncol(counts_for_deg), "\n")
+```
+
+## DREAM Analysis: Exposure Effects
+
+```{r deg-exposure, eval=TRUE, cache=TRUE}
+# ============================================================================
+# EXPOSURE EFFECTS (NO SEX INTERACTION)
+# ============================================================================
+# Set eval=TRUE to run this analysis (takes ~1 hour)
+
+param_MJR <- SnowParam(DREAM_N_CORES, "SOCK", progressbar = TRUE)
+
+# Define model
+model_MJR <- ~ 0 + EXPOSURE + (1 | PATIENTCODE)
+
+# Define contrasts
+contrasts_exposure <- c(
+  Peat5_vs_PBS = "(EXPOSUREPeat_5 - EXPOSUREPBS_Control)",
+  Peat25_vs_PBS = "(EXPOSUREPeat_25 - EXPOSUREPBS_Control)",
+  Euc5_vs_PBS = "(EXPOSUREEucalyptus_5 - EXPOSUREPBS_Control)",
+  Euc25_vs_PBS = "(EXPOSUREEucalyptus_25 - EXPOSUREPBS_Control)",
+  Pine5_vs_PBS = "(EXPOSUREPine_5 - EXPOSUREPBS_Control)",
+  Pine25_vs_PBS = "(EXPOSUREPine_25 - EXPOSUREPBS_Control)",
+  RO5_vs_PBS = "(EXPOSURERedOak_5 - EXPOSUREPBS_Control)",
+  RO25_vs_PBS = "(EXPOSURERedOak_25 - EXPOSUREPBS_Control)",
+  Peat25_vs_Euc25 = "(EXPOSUREPeat_25 - EXPOSUREEucalyptus_25)",
+  Peat25_vs_Pine25 = "(EXPOSUREPeat_25 - EXPOSUREPine_25)",
+  Peat25_vs_RO25 = "(EXPOSUREPeat_25 - EXPOSURERedOak_25)",
+  Euc25_vs_Pine25 = "(EXPOSUREEucalyptus_25 - EXPOSUREPine_25)",
+  Euc25_vs_RO25 = "(EXPOSUREEucalyptus_25 - EXPOSURERedOak_25)",
+  Pine25_vs_RO25 = "(EXPOSUREPine_25 - EXPOSURERedOak_25)"
+)
+
+# Create contrast matrix
+list_MJR <- makeContrastsDream(model_MJR, meta_deg, contrasts = contrasts_exposure)
+
+# Calculate voom with Dream weights
+dream <- voomWithDreamWeights(dataset_MJR, model_MJR, meta_deg, BPPARAM = param_MJR)
+
+# Variance partition analysis
+form <- ~ (1 | PATIENTCODE) + (1 | EXPOSURE)
+vp <- fitExtractVarPartModel(dream, form, meta_deg)
+plotVarPart(sortCols(vp))
+
+# Fit linear model
+dream_fit <- dream(dream, model_MJR, meta_deg, list_MJR)
+dream_fit <- eBayes(dream_fit)
+
+# Extract DEGs
+dream_DEGs <- lapply(names(contrasts_exposure), function(x) {
+  top <- topTable(dream_fit, coef = x, sort.by = "P", n = Inf)
+  data.frame(
+    log2FC = top$logFC,
+    P.Value = top$P.Value,
+    adj.P.Val = top$adj.P.Val,
+    Expression = top$AveExpr,
+    row.names = rownames(top)
+  )
+})
+names(dream_DEGs) <- names(contrasts_exposure)
+
+# Save results
+saveRDS(list(fit = dream_fit, degs = dream_DEGs, voom = dream, vp = vp),
+        here::here(PATH_DATA_PROCESSED, "dream_exposure_results.rds"))
+
+cat("✓ DREAM exposure analysis complete\n")
+```
+
+## DREAM Analysis: Sex × Exposure Interaction
+
+```{r deg-sex-exposure, eval=TRUE, cache=TRUE}
+# ============================================================================
+# SEX × EXPOSURE INTERACTION
+# ============================================================================
+# Set eval=TRUE to run this analysis (takes ~1 hour)
+
+# Filter out incomplete donor
+seq_sex <- seq_degs %>% filter(PATIENTCODE != "DD007T")
+
+# Create interaction variable
+seq_sex$EXPOSURE_SEX <- paste(seq_sex$EXPOSURE, seq_sex$SEX, sep = "_")
+
+# Prepare data
+counts_sex <- as.matrix(t(seq_sex[, 1:(ncol(seq_sex) - 4)]))
+colnames(counts_sex) <- rownames(seq_sex)
+
+meta_sex <- seq_sex %>%
+  select(EXPOSURE_SEX, PATIENTCODE, EXPOSURE, SEX) %>%
+  mutate(
+    EXPOSURE_SEX = factor(EXPOSURE_SEX),
+    PATIENTCODE = factor(PATIENTCODE)
+  )
+
+dataset_MJR_sex <- DGEList(counts_sex, group = meta_sex$EXPOSURE_SEX)
+
+# Define model
+model_MJR_sex <- ~ 0 + EXPOSURE_SEX + (1 | PATIENTCODE)
+
+# Define contrasts
+contrasts_sex <- c(
+  Peat5_vs_PBS_M = "(EXPOSURE_SEXPeat_5_M - EXPOSURE_SEXPBS_Control_M)",
+  Peat25_vs_PBS_M = "(EXPOSURE_SEXPeat_25_M - EXPOSURE_SEXPBS_Control_M)",
+  Euc5_vs_PBS_M = "(EXPOSURE_SEXEucalyptus_5_M - EXPOSURE_SEXPBS_Control_M)",
+  Euc25_vs_PBS_M = "(EXPOSURE_SEXEucalyptus_25_M - EXPOSURE_SEXPBS_Control_M)",
+  Pine5_vs_PBS_M = "(EXPOSURE_SEXPine_5_M - EXPOSURE_SEXPBS_Control_M)",
+  Pine25_vs_PBS_M = "(EXPOSURE_SEXPine_25_M - EXPOSURE_SEXPBS_Control_M)",
+  RO5_vs_PBS_M = "(EXPOSURE_SEXRedOak_5_M - EXPOSURE_SEXPBS_Control_M)",
+  RO25_vs_PBS_M = "(EXPOSURE_SEXRedOak_25_M - EXPOSURE_SEXPBS_Control_M)",
+  Peat5_vs_PBS_F = "(EXPOSURE_SEXPeat_5_F - EXPOSURE_SEXPBS_Control_F)",
+  Peat25_vs_PBS_F = "(EXPOSURE_SEXPeat_25_F - EXPOSURE_SEXPBS_Control_F)",
+  Euc5_vs_PBS_F = "(EXPOSURE_SEXEucalyptus_5_F - EXPOSURE_SEXPBS_Control_F)",
+  Euc25_vs_PBS_F = "(EXPOSURE_SEXEucalyptus_25_F - EXPOSURE_SEXPBS_Control_F)",
+  Pine5_vs_PBS_F = "(EXPOSURE_SEXPine_5_F - EXPOSURE_SEXPBS_Control_F)",
+  Pine25_vs_PBS_F = "(EXPOSURE_SEXPine_25_F - EXPOSURE_SEXPBS_Control_F)",
+  RO5_vs_PBS_F = "(EXPOSURE_SEXRedOak_5_F - EXPOSURE_SEXPBS_Control_F)",
+  RO25_vs_PBS_F = "(EXPOSURE_SEXRedOak_25_F - EXPOSURE_SEXPBS_Control_F)"
+)
+
+list_MJR_sex <- makeContrastsDream(model_MJR_sex, meta_sex, contrasts = contrasts_sex)
+
+# Calculate voom weights
+dream_sex <- voomWithDreamWeights(dataset_MJR_sex, model_MJR_sex, meta_sex, BPPARAM = param_MJR)
+
+# Variance partition
+form_sex <- ~ (1 | PATIENTCODE) + (1 | EXPOSURE) + (1 | SEX)
+vp_sex <- fitExtractVarPartModel(dream_sex, form_sex, meta_sex)
+plotVarPart(sortCols(vp_sex))
+
+# Fit model
+dream_fit_sex <- dream(dream_sex, model_MJR_sex, meta_sex, list_MJR_sex)
+dream_fit_sex <- eBayes(dream_fit_sex)
+
+# Extract DEGs
+dream_DEGs_sex <- lapply(names(contrasts_sex), function(x) {
+  top <- topTable(dream_fit_sex, coef = x, sort.by = "P", n = Inf)
+  data.frame(
+    log2FC = top$logFC,
+    P.Value = top$P.Value,
+    adj.P.Val = top$adj.P.Val,
+    Expression = top$AveExpr,
+    row.names = rownames(top)
+  )
+})
+names(dream_DEGs_sex) <- names(contrasts_sex)
+
+# Save results
+saveRDS(list(fit = dream_fit_sex, degs = dream_DEGs_sex, voom = dream_sex, vp = vp_sex),
+        here::here(PATH_DATA_PROCESSED, "dream_sex_results.rds"))
+
+cat("✓ DREAM sex interaction analysis complete\n")
+```
+
+## Load Pre-computed Results
+
+```{r load-deg-results}
+# Load pre-computed DEG results if they exist
+if (file.exists(here::here(PATH_DATA_PROCESSED, "dream_exposure_results.rds"))) {
+  dream_results <- readRDS(here::here(PATH_DATA_PROCESSED, "dream_exposure_results.rds"))
+  dream_DEGs <- dream_results$degs
+  cat("✓ Loaded pre-computed exposure DEG results\n")
+  cat("  - Contrasts:", length(dream_DEGs), "\n")
+} else {
+  cat("⚠ No pre-computed exposure results found. Run deg-exposure chunk with eval=TRUE\n")
+}
+
+if (file.exists(here::here(PATH_DATA_PROCESSED, "dream_sex_results.rds"))) {
+  dream_sex_results <- readRDS(here::here(PATH_DATA_PROCESSED, "dream_sex_results.rds"))
+  dream_DEGs_sex <- dream_sex_results$degs
+  cat("✓ Loaded pre-computed sex interaction DEG results\n")
+  cat("  - Contrasts:", length(dream_DEGs_sex), "\n")
+} else {
+  cat("⚠ No pre-computed sex results found. Run deg-sex-exposure chunk with eval=TRUE\n")
+}
+```
+
+---
+
+# DEG Classification & Summary
+
+## Classify DEGs
+
+```{r classify-degs}
+# Combine all DEG results into one data frame
+combine_deg_results <- function(deg_list, add_gene_col = TRUE) {
+  combined <- lapply(names(deg_list), function(name) {
+    df <- deg_list[[name]]
+    if (add_gene_col) df$X <- rownames(df)
+    df$file_name <- name
+    df$sample_name <- sub("_.*", "", name)
+    df$Sex <- ifelse(grepl("_F$", name), "Female",
+                     ifelse(grepl("_M$", name), "Male", NA))
+    return(df)
+  })
+  bind_rows(combined)
+}
+
+# Combine exposure and sex DEGs
+if (exists("dream_DEGs")) {
+  combined_degs_exposure <- combine_deg_results(dream_DEGs)
+}
+
+if (exists("dream_DEGs_sex")) {
+  combined_degs_sex <- combine_deg_results(dream_DEGs_sex)
+}
+
+# Merge all
+if (exists("combined_degs_exposure") && exists("combined_degs_sex")) {
+  combined_degs <- bind_rows(combined_degs_exposure, combined_degs_sex)
+} else if (exists("combined_degs_exposure")) {
+  combined_degs <- combined_degs_exposure
+} else {
+  cat("⚠ No DEG results loaded\n")
+}
+
+# Classify DEGs
+if (exists("combined_degs")) {
+  combined_degs <- combined_degs %>%
+    mutate(
+      DEG = case_when(
+        log2FC >= LOG2FC_CUTOFF & adj.P.Val < ADJ_P_CUTOFF ~ "UP",
+        log2FC <= -LOG2FC_CUTOFF & adj.P.Val < ADJ_P_CUTOFF ~ "DOWN",
+        TRUE ~ "NO"
+      )
+    )
+  
+  cat("✓ DEG classification complete\n")
+  
+  # Summary table
+  deg_summary <- combined_degs %>%
+    filter(DEG != "NO") %>%
+    group_by(sample_name, Sex, DEG) %>%
+    summarise(n_genes = n(), .groups = "drop") %>%
+    pivot_wider(names_from = DEG, values_from = n_genes, values_fill = 0)
+  
+  print(deg_summary)
+}
+```
+
+## Export DEG Results
+
+```{r export-degs}
+if (exists("combined_degs")) {
+  # Export full results
+  write_csv(combined_degs, here::here(PATH_OUTPUT_TABLES, "all_deg_results.csv"))
+  
+  # Export significant DEGs only
+  sig_degs <- combined_degs %>% filter(DEG != "NO")
+  write_csv(sig_degs, here::here(PATH_OUTPUT_TABLES, "significant_degs.csv"))
+  
+  # Export by fuel type (high dose only)
+  degs_by_fuel <- combined_degs %>%
+    filter(is.na(Sex), grepl("25", sample_name), DEG != "NO") %>%
+    select(X, log2FC, P.Value, adj.P.Val, Expression, sample_name)
+  write_csv(degs_by_fuel, here::here(PATH_OUTPUT_TABLES, "degs_by_fuel.csv"))
+  
+  # Export by sex (high dose only)
+  degs_by_sex <- combined_degs %>%
+    filter(!is.na(Sex), grepl("25", sample_name), DEG != "NO") %>%
+    select(X, log2FC, P.Value, adj.P.Val, Expression, sample_name, Sex)
+  write_csv(degs_by_sex, here::here(PATH_OUTPUT_TABLES, "degs_by_sex.csv"))
+  
+  cat("✓ DEG results exported\n")
+}
+```
+
+
+---
+
+## IPA Export Tables
+
+```{r export-ipa-tables}
+if (exists("combined_degs")) {
+  
+  # ============================================================================
+  # IPA Export: FUEL TYPE (no sex interaction)
+  # ============================================================================
+  
+  IPA_degs_fuel <- combined_degs %>% 
+    filter(!grepl("(_F|_M)$", file_name)) %>%  # Exclude sex-stratified results
+    select(-P.Value, -Expression)  # Keep only log2FC and adj.P.Val
+  
+  # Pivot to wide format
+  IPA_degs_fuel_wide <- IPA_degs_fuel %>%
+    pivot_wider(
+      names_from = file_name, 
+      values_from = c(log2FC, adj.P.Val)
+    )
+  
+  # Filter for high-dose (25) comparisons only
+  IPA_degs_fuel_filtered <- IPA_degs_fuel_wide %>% 
+    select(X, contains("25"))
+  
+  # Save
+  save_table(IPA_degs_fuel_filtered, "IPA_DEGs_FUEL.csv")
+  
+  cat("✓ IPA fuel type table exported\n")
+  cat("  - Genes:", nrow(IPA_degs_fuel_filtered), "\n")
+  cat("  - Comparisons:", (ncol(IPA_degs_fuel_filtered) - 1) / 2, "\n")
+  
+  # ============================================================================
+  # IPA Export: SEX-STRATIFIED
+  # ============================================================================
+  
+  IPA_degs_sex <- combined_degs %>% 
+    filter(grepl("(_F|_M)$", file_name)) %>%  # Only sex-stratified results
+    select(-P.Value, -Expression)
+  
+  # Pivot to wide format
+  IPA_degs_sex_wide <- IPA_degs_sex %>%
+    pivot_wider(
+      names_from = file_name, 
+      values_from = c(log2FC, adj.P.Val)
+    )
+  
+  # Filter for high-dose (25) comparisons only
+  IPA_degs_sex_filtered <- IPA_degs_sex_wide %>% 
+    select(X, contains("25"))
+  
+  # Save
+  save_table(IPA_degs_sex_filtered, "IPA_DEGs_SEX.csv")
+  
+  cat("✓ IPA sex-stratified table exported\n")
+  cat("  - Genes:", nrow(IPA_degs_sex_filtered), "\n")
+  cat("  - Comparisons:", (ncol(IPA_degs_sex_filtered) - 1) / 2, "\n")
+  
+} else {
+  cat("⚠ combined_degs not found. Run DEG analysis first.\n")
+}
+```
+
+---
+
+# Visualization
+
+## Volcano Plots: Fuel Type
+
+```{r volcano-fuel, fig.width=14, fig.height=8}
+if (exists("combined_degs")) {
+  # Filter for high-dose fuel comparisons
+  fuel_degs <- combined_degs %>%
+    filter(is.na(Sex), grepl("25_vs_PBS", file_name)) %>%
+    mutate(sample_name = case_when(
+      sample_name == "Euc25" ~ "Eucalyptus 25 µg/cm²",
+      sample_name == "Peat25" ~ "Peat 25 µg/cm²",
+      sample_name == "Pine25" ~ "Pine 25 µg/cm²",
+      sample_name == "RO25" ~ "Red Oak 25 µg/cm²",
+      TRUE ~ sample_name
+    ))
+  
+  # Define highlighted genes
+  selected_genes <- c('SPDEF', 'IL1A', 'IL1B', 'SRXN1')
+  
+  # Add labels for top genes
+  fuel_degs <- fuel_degs %>%
+    group_by(file_name, DEG) %>%
+    mutate(
+      delabel = case_when(
+        DEG == "UP" & row_number(adj.P.Val) <= 6 ~ X,
+        DEG == "DOWN" & row_number(adj.P.Val) <= 6 ~ X,
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    ungroup()
+  
+  # Count UP and DOWN genes for each sample_name
+  up_counts <- fuel_degs %>%
+    filter(DEG == "UP") %>%
+    group_by(sample_name) %>%
+    summarise(n = n(), .groups = "drop")
+  
+  down_counts <- fuel_degs %>%
+    filter(DEG == "DOWN") %>%
+    group_by(sample_name) %>%
+    summarise(n = n(), .groups = "drop")
+  
+  # Create volcano plot
+  p_volcano_fuel <- ggplot(data = fuel_degs, aes(x = log2FC, y = -log10(adj.P.Val), color = DEG, label = delabel)) +
+    geom_vline(xintercept = c(-1, 1), col = "gray", linetype = 'dashed') +
+    geom_hline(yintercept = -log10(0.05), col = "gray", linetype = 'dashed') +
+    
+    # Plot all genes first
+    geom_point(alpha = 0.7, size = 2) +
+    
+    # Overlay labeled genes with black outlines
+    geom_point(data = subset(fuel_degs, !is.na(delabel) | X %in% selected_genes),
+               aes(x = log2FC, y = -log10(adj.P.Val)),
+               color = "black", size = 2, shape = 21, stroke = 1) +
+    
+    # Add labels with white boxes
+    geom_label_repel(data = subset(fuel_degs, !is.na(delabel) | X %in% selected_genes),
+                     aes(label = ifelse(!is.na(delabel), delabel, X)),
+                     size = 3, fontface = "bold", fill = "white", color = "black",
+                     box.padding = 0.4, segment.color = "black", max.overlaps = 20) +
+    
+    # Annotate UP count at the top-right corner
+    geom_text(data = up_counts, aes(x = 3.5, y = 30.5, label = paste0("UP: ", n)),
+              color = "#bb0c00", size = 3, fontface = "bold", hjust = 1, inherit.aes = FALSE) +
+    
+    # Annotate DOWN count at the top-left corner
+    geom_text(data = down_counts, aes(x = -4.5, y = 30.5, label = paste0("DOWN: ", n)),
+              color = "#00AFBB", size = 3, fontface = "bold", hjust = 0, inherit.aes = FALSE) +
+    
+    scale_color_manual(
+      values = c("DOWN" = "#00AFBB", "NO" = "grey", "UP" = "#bb0c00"),
+      labels = c("Downregulated", "Not significant", "Upregulated")
+    ) +
+    coord_cartesian(ylim = c(0, 30), xlim = c(-8, 8)) +
+    labs(
+      x = expression("log"[2] * "FC"),
+      y = expression("-log"[10] * "adj.P.Val")
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      strip.text = element_text(size = 12, face = "bold"),
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = .5),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "#ffffff", color = NA),
+      legend.background = element_rect(fill = "#ffffff", color = NA),
+      legend.key = element_rect(fill = "#ffffff", color = NA),
+      panel.grid.major = element_line(color = "gray80"),
+      panel.grid.minor = element_line(color = "gray90")
+    ) +
+    facet_wrap(~ sample_name)
+  
+  print(p_volcano_fuel)
+  save_plot("volcano_plot_fuel_type.png", p_volcano_fuel, width = 14, height = 8, bg = "white")
+}
+```
+
+## Volcano Plots: Sex Comparison
+
+```{r volcano-sex, fig.width=14, fig.height=10}
+if (exists("combined_degs")) {
+  # Filter for high-dose sex comparisons
+  sex_degs_high <- combined_degs %>%
+    filter(!is.na(Sex), grepl("25_vs_PBS", file_name)) %>%
+    mutate(sample_name = case_when(
+      sample_name == "Euc25" ~ "Eucalyptus 25 µg/cm²",
+      sample_name == "Peat25" ~ "Peat 25 µg/cm²",
+      sample_name == "Pine25" ~ "Pine 25 µg/cm²",
+      sample_name == "RO25" ~ "Red Oak 25 µg/cm²",
+      TRUE ~ sample_name
+    ))
+  
+  # Add labels
+  sex_degs_high <- sex_degs_high %>%
+    group_by(file_name, DEG) %>%
+    mutate(
+      delabel = case_when(
+        DEG == "UP" & row_number(adj.P.Val) <= 6 ~ X,
+        DEG == "DOWN" & row_number(adj.P.Val) <= 6 ~ X,
+        X %in% highlighted_genes ~ X,
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    ungroup()
+  
+  # Define highlighted genes
+  selected_genes <- c('SPDEF', 'IL1A', 'IL1B', 'SRXN1')
+  
+  # Function to plot sex volcano with background color
+  plot_sex_degs <- function(sex_choice, selected_genes) {     
+    # Ensure Male is on top in the facet grid   
+    sex_degs_high$Sex <- factor(sex_degs_high$Sex, levels = c("Male", "Female"))    
+    
+    # Filter data based on the specified sex     
+    filtered_data <- subset(sex_degs_high, Sex == sex_choice)    
+    
+    # Specify the background color for the sex chosen     
+    background_color <- ifelse(sex_choice == "Female", "#fff0f3", "#F0FFF0")    
+    
+    # Count UP and DOWN genes for each sample_name
+    up_counts <- filtered_data %>%
+      dplyr::filter(DEG == "UP") %>%
+      dplyr::group_by(Sex, sample_name) %>%
+      dplyr::summarise(n = n(), .groups = "drop")
+    
+    down_counts <- filtered_data %>%
+      dplyr::filter(DEG == "DOWN") %>%
+      dplyr::group_by(Sex, sample_name) %>%
+      dplyr::summarise(n = n(), .groups = "drop")
+    
+    # Generate the plot     
+    p <- ggplot(data = filtered_data, aes(x = log2FC, y = -log10(adj.P.Val), color = DEG, label = delabel)) +       
+      geom_vline(xintercept = c(-1, 1), col = "gray", linetype = 'dashed') +       
+      geom_hline(yintercept = -log10(0.05), col = "gray", linetype = 'dashed') +      
+      geom_point(alpha = 0.7, size = 2) +      
+      geom_point(data = subset(filtered_data, !is.na(delabel) | X %in% selected_genes),                  
+                 aes(x = log2FC, y = -log10(adj.P.Val)),                  
+                 color = "black", size = 2, shape = 21, stroke = 1) +      
+      geom_label_repel(data = subset(filtered_data, !is.na(delabel) | X %in% selected_genes),                        
+                       aes(label = ifelse(!is.na(delabel), delabel, X)),                        
+                       size = 3, fontface = "bold", fill = "white", color = "black",                        
+                       box.padding = 0.4, segment.color = "black", max.overlaps = 20) +      
+      geom_text(data = up_counts, aes(x = 3.5, y = 20.5, label = paste0("UP: ", n)), 
+                color = "#bb0c00", size = 3, fontface = "bold", hjust = 1, inherit.aes = FALSE) +
+      geom_text(data = down_counts, aes(x = -4.5, y = 20.5, label = paste0("DOWN: ", n)), 
+                color = "#00AFBB", size = 3, fontface = "bold", hjust = 0, inherit.aes = FALSE) +
+      scale_color_manual(           
+        values = c("DOWN" = "#00AFBB", "NO" = "grey", "UP" = "#bb0c00"),           
+        labels = c("Downregulated", "Not significant", "Upregulated")       
+      ) +       
+      coord_cartesian(ylim = c(0, 20), xlim = c(-8, 8)) +       
+      labs(           
+        x = expression("log"[2] * "FC"),           
+        y = expression("-log"[10] * "adj.P.Val")       
+      ) +       
+      theme_minimal(base_size = 14) +         
+      theme(           
+        strip.text = element_text(size = 12, face = "bold"),           
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),           
+        panel.border = element_rect(color = "black", fill = NA, linewidth = .5),         
+        panel.background = element_rect(fill = background_color, color = NA),  # BACKGROUND COLOR HERE
+        plot.background = element_rect(fill = "#ffffff", color = NA),         
+        legend.background = element_rect(fill = "#ffffff", color = NA),         
+        legend.key = element_rect(fill = "#ffffff", color = NA),
+        panel.grid.major = element_line(color = "gray80"),         
+        panel.grid.minor = element_line(color = "gray90")
+      ) +          
+      facet_grid(Sex ~ sample_name, scales = "free_y")
+    
+    return(p)
+  }
+  
+  # Create plots for both sexes
+  p_male <- plot_sex_degs("Male", selected_genes)
+  p_female <- plot_sex_degs("Female", selected_genes)
+  
+  print(p_male)
+  print(p_female)
+  
+  save_plot("volcano_plot_male.png", p_male, width = 16, height = 4)
+  save_plot("volcano_plot_female.png", p_female, width = 16, height = 4)
+}
+```
+
+
+## UpSet Plots: DEG Overlap
+
+```{r upset-plots, fig.width=12, fig.height=8}
+library(ComplexUpset)
+
+if (exists("combined_degs")) {
+  # Custom fuel colors
+  fuel_colors <- c(
+    "Red Oak 25 µg/cm²" = "brown3",
+    "Pine 25 µg/cm²" = "deepskyblue3",
+    "Peat 25 µg/cm²" = "gold3",
+    "Eucalyptus 25 µg/cm²" = "darkorchid"
+  )
+  
+  # ============================================================================
+  # PLOT 1: Fuel type UpSet (all samples combined)
+  # ============================================================================
+  
+  # Prepare data
+  degs_by_fuel_upset <- combined_degs %>%
+    filter(is.na(Sex), grepl("25_vs_PBS", file_name), DEG != "NO") %>%
+    mutate(sample_name = case_when(
+      sample_name == "Euc25" ~ "Eucalyptus 25 µg/cm²",
+      sample_name == "Peat25" ~ "Peat 25 µg/cm²",
+      sample_name == "Pine25" ~ "Pine 25 µg/cm²",
+      sample_name == "RO25" ~ "Red Oak 25 µg/cm²",
+      TRUE ~ sample_name
+    )) %>%
+    distinct(X, sample_name)
+  
+  if (nrow(degs_by_fuel_upset) > 0) {
+    deg_wide <- degs_by_fuel_upset %>%
+      mutate(present = TRUE) %>%
+      pivot_wider(
+        names_from = sample_name,
+        values_from = present,
+        values_fill = FALSE
+      )
+    
+    fuel_sets <- names(fuel_colors)
+    
+    fuel_plot <- upset(
+      deg_wide,
+      intersect = fuel_sets,
+      set_sizes = upset_set_size(
+        geom = geom_bar(aes(fill = group), width = 0.6)
+      ),
+      queries = list(
+        upset_query(set = "Red Oak 25 µg/cm²", color = "brown3", fill = "brown3"),
+        upset_query(set = "Pine 25 µg/cm²", color = "deepskyblue3", fill = "deepskyblue3"),
+        upset_query(set = "Peat 25 µg/cm²", color = "gold3", fill = "gold3"),
+        upset_query(set = "Eucalyptus 25 µg/cm²", color = "darkorchid", fill = "darkorchid")
+      ),
+      base_annotations = list(
+        'Intersection size' = intersection_size(
+          counts = TRUE,
+          bar_number_threshold = 1,
+          text = list(size = 3)
+        )
+      ),
+      matrix = (
+        intersection_matrix(
+          geom = geom_point(aes(color = group), size = 3, shape = 19),
+          segment = geom_segment(color = "black", size = 0.5),
+          outline_color = list(active = "black", inactive = "grey70")
+        )
+        + scale_color_manual(values = fuel_colors, breaks = fuel_sets)
+      ),
+      themes = upset_default_themes(text = element_text(size = 12))
+    ) +
+      ggtitle("UpSet Plot of DEGs by Fuel Type") +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+      )
+    
+    print(fuel_plot)
+    save_plot("DEGs_by_FuelType_UpSet.png", fuel_plot, width = 12, height = 8, bg = "white")
+    
+    # ============================================================================
+    # PLOT 2 & 3: Sex-stratified UpSet plots
+    # ============================================================================
+    
+    # Prepare sex-stratified data
+    degs_by_sex_upset <- combined_degs %>%
+      filter(!is.na(Sex), grepl("25_vs_PBS", file_name), DEG != "NO") %>%
+      mutate(sample_name = case_when(
+        sample_name == "Euc25" ~ "Eucalyptus 25 µg/cm²",
+        sample_name == "Peat25" ~ "Peat 25 µg/cm²",
+        sample_name == "Pine25" ~ "Pine 25 µg/cm²",
+        sample_name == "RO25" ~ "Red Oak 25 µg/cm²",
+        TRUE ~ sample_name
+      ))
+    
+    # Male data
+    male_data <- degs_by_sex_upset %>%
+      filter(Sex == "Male") %>%
+      distinct(X, sample_name) %>%
+      mutate(present = TRUE) %>%
+      pivot_wider(
+        names_from = sample_name,
+        values_from = present,
+        values_fill = FALSE
+      )
+    
+    # Female data
+    female_data <- degs_by_sex_upset %>%
+      filter(Sex == "Female") %>%
+      distinct(X, sample_name) %>%
+      mutate(present = TRUE) %>%
+      pivot_wider(
+        names_from = sample_name,
+        values_from = present,
+        values_fill = FALSE
+      )
+    
+    # Function to create upset plot with proper colors
+    create_upset_plot <- function(data, title_text) {
+      upset(
+        data,
+        intersect = fuel_sets,
+        set_sizes = upset_set_size(
+          geom = geom_bar(aes(fill = group), width = 0.6)
+        ),
+        queries = list(
+          upset_query(set = "Red Oak 25 µg/cm²", color = "brown3", fill = "brown3"),
+          upset_query(set = "Pine 25 µg/cm²", color = "deepskyblue3", fill = "deepskyblue3"),
+          upset_query(set = "Peat 25 µg/cm²", color = "gold3", fill = "gold3"),
+          upset_query(set = "Eucalyptus 25 µg/cm²", color = "darkorchid", fill = "darkorchid")
+        ),
+        base_annotations = list(
+          'Intersection size' = intersection_size(
+            counts = TRUE,
+            bar_number_threshold = 1,
+            text = list(size = 3)
+          )
+        ),
+        matrix = (
+          intersection_matrix(
+            geom = geom_point(aes(color = group), size = 3, shape = 19),
+            segment = geom_segment(color = "black", size = 0.5),
+            outline_color = list(active = "black", inactive = "grey70")
+          )
+          + scale_color_manual(values = fuel_colors, breaks = fuel_sets)
+        ),
+        themes = upset_default_themes(text = element_text(size = 12))
+      ) +
+        ggtitle(title_text) +
+        theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+    }
+    
+    # Create and save male plot
+    if (nrow(male_data) > 1) {
+      male_plot <- create_upset_plot(male_data, "DEGs by Fuel Type - Males")
+      print(male_plot)
+      save_plot("DEGs_Male_UpSet.png", male_plot, width = 12, height = 8, bg = "white")
+    }
+    
+    # Create and save female plot
+    if (nrow(female_data) > 1) {
+      female_plot <- create_upset_plot(female_data, "DEGs by Fuel Type - Females")
+      print(female_plot)
+      save_plot("DEGs_Female_UpSet.png", female_plot, width = 12, height = 8, bg = "white")
+    }
+    
+    cat("\n✓ All UpSet plots created and saved\n")
+    cat("  - Fuel type combined\n")
+    cat("  - Male stratified\n")
+    cat("  - Female stratified\n")
+  }
+}
+```
+
+## Euler Diagrams: DEG Overlap
+
+```{r euler-deg-overlap, fig.width=10, fig.height=8}
+library(eulerr)
+
+if (exists("combined_degs")) {
+  
+  # Define custom colors for fuel types
+  fuel_colors_euler <- c(
+    "RO25" = "brown3", 
+    "Pine25" = "deepskyblue3", 
+    "Euc25" = "darkorchid", 
+    "Peat25" = "gold3"
+  )
+  
+  # ============================================================================
+  # FUEL TYPE: UP and DOWN regulated genes
+  # ============================================================================
+  
+  only_fueltype_degs <- combined_degs %>%
+    filter(is.na(Sex), grepl("25", sample_name), DEG != "NO") %>%
+    mutate(delabel = X)
+  
+  cat("\n=== FUEL TYPE EULER PLOTS ===\n")
+  
+  # Loop through UP and DOWN
+  for (direction in c("UP", "DOWN")) {
+    
+    # Get list of genes for each fuel type
+    fuel_types <- unique(only_fueltype_degs$sample_name)
+    
+    eul_list <- lapply(fuel_types, function(fuel) {
+      subset(only_fueltype_degs, sample_name == fuel & DEG == direction)$delabel
+    })
+    
+    # Remove duplicates
+    eul_list_unique <- lapply(eul_list, unique)
+    names(eul_list_unique) <- fuel_types
+    
+    # Get conserved genes
+    overlap_genes <- Reduce(intersect, eul_list_unique)
+    cat("\n", direction, "-regulated genes conserved across fuel types:", length(overlap_genes), "\n")
+    
+    # Set colors
+    col <- fuel_colors_euler[fuel_types]
+    
+    # Fit Euler diagram
+    fit <- euler(eul_list_unique)
+    
+    # Save plot using grDevices
+    filename <- here::here(PATH_OUTPUT_FIGURES, paste0("euler_fuel_", direction, ".png"))
+    png(filename, width = 10, height = 8, units = "in", res = 300, bg = "white")
+    
+    # Use print() to force rendering
+    print(
+      plot(fit,
+           fills = list(fill = col, alpha = 0.5),
+           legend = list(side = "bottom", col = col, text.col = "black"),
+           quantities = list(cex = 1.2, fontface = "bold"),
+           main = paste0(direction, "-regulated Genes by Fuel Type"))
+    )
+    
+    dev.off()
+    
+    cat("✓ Saved:", basename(filename), "\n")
+  }
+  
+  # ============================================================================
+  # SEX-STRATIFIED: UP and DOWN regulated genes
+  # ============================================================================
+  
+  only_sex_degs <- combined_degs %>%
+    filter(!is.na(Sex), grepl("25", sample_name), DEG != "NO") %>%
+    mutate(delabel = X)
+  
+  cat("\n=== SEX-STRATIFIED EULER PLOTS ===\n")
+  
+  # Loop through Female and Male
+  for (sex in c("Female", "Male")) {
+    
+    filtered_data <- subset(only_sex_degs, Sex == sex)
+    
+    # Loop through UP and DOWN
+    for (direction in c("UP", "DOWN")) {
+      
+      filtered_direction_data <- subset(filtered_data, DEG == direction)
+      
+      fuel_types <- unique(filtered_direction_data$sample_name)
+      
+      # Skip if no fuel types
+      if (length(fuel_types) == 0) {
+        cat("⚠ No fuel types for", sex, direction, "\n")
+        next
+      }
+      
+      eul_list <- lapply(fuel_types, function(fuel) {
+        subset(filtered_direction_data, sample_name == fuel)$delabel
+      })
+      
+      # Remove duplicates
+      eul_list_unique <- lapply(eul_list, unique)
+      names(eul_list_unique) <- fuel_types
+      
+      # Get conserved genes
+      overlap_genes <- Reduce(intersect, eul_list_unique)
+      cat("\n", sex, "-", direction, "genes conserved:", length(overlap_genes), "\n")
+      
+      # Set colors
+      col <- fuel_colors_euler[fuel_types]
+      
+      # Fit Euler diagram
+      fit <- euler(eul_list_unique)
+      
+      # Save plot
+      filename <- here::here(PATH_OUTPUT_FIGURES, paste0("euler_", tolower(sex), "_", direction, ".png"))
+      png(filename, width = 10, height = 8, units = "in", res = 300, bg = "white")
+      
+      # Use print() to force rendering
+      print(
+        plot(fit,
+             fills = list(fill = col, alpha = 0.5),
+             legend = list(side = "bottom", col = col, text.col = "black"),
+             quantities = list(cex = 1.2, fontface = "bold"),
+             main = paste0(sex, " - ", direction, "-regulated Genes by Fuel Type"))
+      )
+      
+      dev.off()
+      
+      cat("✓ Saved:", basename(filename), "\n")
+    }
+  }
+  
+  cat("\n✓ All Euler diagrams saved to:", PATH_OUTPUT_FIGURES, "\n")
+  
+} else {
+  cat("⚠ combined_degs not found. Run DEG analysis first.\n")
+}
+```
+
+## Gene Expression Barplots
+
+```{r gene-expression-bars, fig.width=12, fig.height=4}
+if (exists("vst_counts_df")) {
+  # Select genes of interest
+  genes_of_interest <- c("IL1A", "SPDEF", "CYP1A1", "TXNRD1")
+  
+  # Plot gene expression
+  p_gene_expr <- plot_gene_expression_bars(
+    vst_data = vst_counts_df,
+    metadata = meta_data_subset,
+    genes = genes_of_interest
+  )
+  
+  print(p_gene_expr)
+  save_plot("gene_expression_barplots.png", p_gene_expr, width = 12, height = 4)
+}
+```
+
+---
+
+# GSEA Pathway Analysis
+
+## Load GSEA Results
+
+```{r load-gsea}
+# Define folder containing GSEA HTML results
+folder_path_gsea <- here::here("data", "raw", "GSEA")
+
+if (dir.exists(folder_path_gsea)) {
+  html_files <- list.files(path = folder_path_gsea, pattern = "\\.html$", full.names = TRUE)
+  
+  if (length(html_files) > 0) {
+    cat("Found", length(html_files), "GSEA HTML files\n")
+    
+    # Read and parse HTML files
+    html_content <- lapply(html_files, function(file) {
+      tryCatch(read_html(file), error = function(e) NULL)
+    })
+    names(html_content) <- tools::file_path_sans_ext(basename(html_files))
+    
+    # Remove NULL entries (failed reads)
+    html_content <- html_content[!sapply(html_content, is.null)]
+    
+    # Extract tables
+    gsea_tables <- lapply(html_content, function(html) {
+      table <- html %>% html_element("table")
+      if (!is.null(table)) html_table(table) else NULL
+    })
+    
+    # Combine into single data frame
+    gsea_results <- bind_rows(
+      lapply(names(gsea_tables), function(name) {
+        if (!is.null(gsea_tables[[name]])) {
+          df <- gsea_tables[[name]]
+          df$File_Name <- name
+          return(df)
+        }
+      })
+    )
+    
+    # Clean column names (adjust based on your GSEA output format)
+    if (ncol(gsea_results) >= 11) {
+      colnames(gsea_results) <- c("Number", "Pathway", "Details", "Size", "ES", "NES", 
+                                   "NOM_pval", "FDR_qval", "FWER_pval", "RANK_AT_MAX", 
+                                   "LEADING_EDGE", "File_Name")
+    }
+    
+    # Add metadata
+    gsea_results <- gsea_results %>%
+      mutate(
+        sample_name = sub("_.*", "", File_Name),
+        Sex = ifelse(grepl("_F_", File_Name), "Female",
+                     ifelse(grepl("_M_", File_Name), "Male", NA)),
+        FDR_qval = as.numeric(FDR_qval),
+        NES = as.numeric(NES)
+      )
+    
+    cat("✓ GSEA results loaded\n")
+    cat("  - Total pathways:", nrow(gsea_results), "\n")
+    cat("  - Unique comparisons:", length(unique(gsea_results$File_Name)), "\n")
+    
+  } else {
+    cat("⚠ No HTML files found in GSEA folder\n")
+  }
+} else {
+  cat("⚠ GSEA results folder not found at:", folder_path_gsea, "\n")
+  cat("  Please check the path or set eval=FALSE for GSEA chunks\n")
+}
+```
+
+## GSEA Pathway Barplots
+
+```{r gsea-barplots, fig.width=14, fig.height=8}
+if (exists("gsea_results")) {
+  # Filter for significant pathways
+  gsea_sig <- gsea_results %>%
+    filter(FDR_qval < FDR_THRESHOLD, !grepl("_(F|M)_", File_Name))
+  
+  # Plot top pathways by fuel type
+  p_gsea_fuel <- plot_gsea_barplot(
+    gsea_data = gsea_sig,
+    n_top = 12,
+    facet_by = "sample_name"
+  )
+  
+  print(p_gsea_fuel)
+  save_plot("gsea_pathways_fuel.png", p_gsea_fuel, width = 14, height = 8)
+}
+```
+
+```{r gsea-barplots-sex, fig.width=14, fig.height=8}
+if (exists("gsea_results")) {
+  # Filter for sex-stratified, significant pathways
+  # DON'T filter by '25' since sample names don't contain it
+  gsea_sex_sig <- gsea_results %>%
+    filter(!is.na(Sex), FDR_qval < 0.251)  # Removed the grepl("25") filter
+  
+  cat("After filtering (FDR < 0.251, Sex stratified):", nrow(gsea_sex_sig), "rows\n")
+  
+  if (nrow(gsea_sex_sig) > 0) {
+    cat("Sample breakdown:\n")
+    print(table(gsea_sex_sig$sample_name, gsea_sex_sig$Sex))
+    
+    # Select top pathways and prioritize important ones
+    gsea_sex_plot <- gsea_sex_sig %>%
+      mutate(
+        priority = case_when(
+          Pathway %in% paste0("HALLMARK_", priority_pathways) ~ 1,
+          TRUE ~ 2
+        )
+      ) %>%
+      group_by(Sex, sample_name) %>%
+      arrange(priority, FDR_qval) %>%
+      slice_head(n = 12) %>%
+      ungroup() %>%
+      mutate(
+        Path = gsub("^HALLMARK_", "", Pathway),
+        Path = gsub("_", " ", Path),
+        sample_name_clean = case_when(
+          sample_name == "Euc" ~ "Eucalyptus",
+          sample_name == "Peat" ~ "Peat",
+          sample_name == "Pine" ~ "Pine",
+          sample_name %in% c("RO", "RedOak") ~ "Red Oak",
+          TRUE ~ sample_name
+        )
+      )
+    
+    cat("After selecting top 12 per group:", nrow(gsea_sex_plot), "rows\n")
+    cat("Male pathways:", sum(gsea_sex_plot$Sex == "Male"), "\n")
+    cat("Female pathways:", sum(gsea_sex_plot$Sex == "Female"), "\n")
+    
+    # ============================================================================
+    # MALE BARPLOT
+    # ============================================================================
+    male_data <- gsea_sex_plot %>% filter(Sex == "Male")
+    
+    if (nrow(male_data) > 0) {
+      cat("Creating male barplot with", nrow(male_data), "pathways\n")
+      
+      p_male <- ggplot(male_data, aes(x = reorder(Path, NES), y = NES, fill = FDR_qval)) +
+        geom_col() +
+        scale_fill_gradient(low = "darkgreen", high = "gray", limits = c(0, 0.35)) +
+        geom_hline(yintercept = 0, color = "black", size = 0.5) +
+        theme_minimal() +
+        theme(
+          axis.text.x = element_text(face = "bold", angle = 0, vjust = 0.5, hjust = 0.5),
+          axis.text.y = element_text(face = "bold"),
+          axis.title.x = element_text(face = "bold"),
+          axis.title.y = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0.5),
+          legend.title = element_text(face = "bold"),
+          legend.text = element_text(face = "bold"),
+          panel.grid.major.x = element_line(size = 1),
+          axis.line.y = element_line(color = "black", size = 0.5),
+          panel.border = element_rect(color = "black", size = 1, fill = NA),
+          panel.background = element_blank(),
+          strip.text = element_text(size = 12, face = "bold"),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor.x = element_blank()
+        ) +
+        coord_flip() +
+        scale_y_continuous(
+          limits = c(-2.5, 2.5),
+          breaks = seq(-2, 2, by = 1),
+          expand = c(0, 0)
+        ) +
+        labs(
+          x = "Pathway",
+          y = "Normalized Enrichment Score",
+          title = "Male Hallmark Pathways Enrichment Score from GSEA",
+          fill = "FDR qval"
+        ) +
+        facet_wrap(~ sample_name_clean, scales = "free_y")
+      
+      print(p_male)
+      save_plot("Male_Pathways.jpg", p_male, width = 14, height = 8)
+      cat("✓ Male barplot saved\n")
+    } else {
+      cat("⚠ No male pathways to plot\n")
+    }
+    
+    # ============================================================================
+    # FEMALE BARPLOT
+    # ============================================================================
+    female_data <- gsea_sex_plot %>% filter(Sex == "Female")
+    
+    if (nrow(female_data) > 0) {
+      cat("Creating female barplot with", nrow(female_data), "pathways\n")
+      
+      p_female <- ggplot(female_data, aes(x = reorder(Path, NES), y = NES, fill = FDR_qval)) +
+        geom_col() +
+        scale_fill_gradient(low = "darkmagenta", high = "gray", limits = c(0, 0.35)) +
+        geom_hline(yintercept = 0, color = "black", size = 0.5) +
+        theme_minimal() +
+        theme(
+          axis.text.x = element_text(face = "bold", angle = 0, vjust = 0.5, hjust = 0.5),
+          axis.text.y = element_text(face = "bold"),
+          axis.title.x = element_text(face = "bold"),
+          axis.title.y = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0.5),
+          legend.title = element_text(face = "bold"),
+          legend.text = element_text(face = "bold"),
+          panel.grid.major.x = element_line(size = 1),
+          axis.line.y = element_line(color = "black", size = 0.5),
+          panel.border = element_rect(color = "black", size = 1, fill = NA),
+          panel.background = element_blank(),
+          strip.text = element_text(size = 12, face = "bold"),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor.x = element_blank()
+        ) +
+        coord_flip() +
+        scale_y_continuous(
+          limits = c(-2.5, 2.5),
+          breaks = seq(-2, 2, by = 1),
+          expand = c(0, 0)
+        ) +
+        labs(
+          x = "Pathway",
+          y = "Normalized Enrichment Score",
+          title = "Female Hallmark Pathways Enrichment Score from GSEA",
+          fill = "FDR qval"
+        ) +
+        facet_wrap(~ sample_name_clean, scales = "free_y")
+      
+      print(p_female)
+      save_plot("Female_Pathways.jpg", p_female, width = 14, height = 8)
+      cat("✓ Female barplot saved\n")
+    } else {
+      cat("⚠ No female pathways to plot\n")
+    }
+    
+    cat("\n✓ Sex-stratified GSEA barplots complete\n")
+  } else {
+    cat("⚠ No significant sex-stratified GSEA results found\n")
+  }
+}
+```
+
+## GSEA Dot Plot
+
+```{r gsea-dotplot, fig.width=12, fig.height=8}
+if (exists("gsea_results")) {
+  # Define pathway list for dot plots
+  pathway_list <- c("REACTIVE_OXYGEN_SPECIES_PATHWAY", "ANDROGEN_RESPONSE", 
+                    "ESTROGEN_RESPONSE_EARLY", "IL6_JAK_STAT3_SIGNALING", 
+                    "TNFA_SIGNALING_VIA_NFKB", "TGF_BETA_SIGNALING", 
+                    "OXIDATIVE_PHOSPHORYLATION", "G2M_CHECKPOINT", "GLYCOLYSIS")
+  
+  # ============================================================================
+  # PREPARE DATA
+  # ============================================================================
+  
+  # Sex-stratified data
+  sex_df_relevant <- gsea_results %>%
+    filter(!is.na(Sex)) %>%
+    mutate(
+      clean_path = gsub("HALLMARK_", "", Pathway),
+      clean_path = gsub("_", " ", clean_path),
+      sample_sex = paste(sample_name, Sex, sep = "_")
+    )
+  
+  # Fuel type only data
+  fueltype_df_relevant <- gsea_results %>%
+    filter(is.na(Sex)) %>%
+    mutate(
+      clean_path = gsub("HALLMARK_", "", Pathway),
+      clean_path = gsub("_", " ", clean_path)
+    )
+  
+  # Filter for significant and relevant pathways
+  sex_df_relevant_subset <- sex_df_relevant %>%
+    filter(FDR_qval < 0.251) %>%
+    filter(clean_path %in% gsub("_", " ", pathway_list))
+  
+  fueltype_df_relevant_subset <- fueltype_df_relevant %>%
+    filter(FDR_qval < 0.251) %>%
+    filter(clean_path %in% gsub("_", " ", pathway_list))
+  
+  # ============================================================================
+  # PLOT 1: SEX-STRATIFIED DOT PLOT
+  # ============================================================================
+  
+  if (nrow(sex_df_relevant_subset) > 0) {
+    # CORRECT ordering: sort by fuel type (before underscore), NOT by sex
+    # This keeps F and M together for each fuel type
+    all_combos <- unique(sex_df_relevant_subset$sample_sex)
+    
+    # Sort by fuel type first (everything before the underscore)
+    ordered_combos <- all_combos[order(sub("_.*", "", all_combos), sub(".*_", "", all_combos))]
+    
+    sex_df_relevant_subset$sample_sex <- factor(
+      sex_df_relevant_subset$sample_sex,
+      levels = ordered_combos
+    )
+    
+    cat("X-axis order:", paste(levels(sex_df_relevant_subset$sample_sex), collapse = ", "), "\n")
+    
+    p89 <- ggplot(sex_df_relevant_subset, 
+                  aes(x = sample_sex, y = clean_path, size = abs(NES), color = NES)) + 
+      geom_point() + 
+      scale_size_continuous(range = c(2, 10), limits = c(1, 2.4)) +
+      scale_color_gradient2(
+        low = "blue", mid = "white", high = "red", midpoint = 0,
+        limits = c(-2.3, 2.3),
+        name = "NES"
+      ) + 
+      theme_minimal() + 
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+        axis.text.y = element_text(face = "bold", hjust = 1),
+        axis.title.x = element_text(face = "bold"),
+        axis.title.y = element_text(face = "bold"),
+        plot.title = element_text(face = "bold"),
+        legend.title = element_text(face = "bold"),
+        legend.text = element_text(face = "bold"),
+        legend.key = element_rect(fill = "white"),
+        panel.grid.major = element_line(color = "black"),
+        panel.grid.minor = element_line(color = "black")
+      ) + 
+      labs(
+        title = "GSEA Results by Fuel and Sex",
+        x = "Fuel Type_Sex",
+        y = "Pathway",
+        size = "Absolute NES",
+        color = "NES"
+      ) + 
+      guides(color = guide_colorbar(title = "NES", title.position = "top"))
+    
+    print(p89)
+    save_plot("Sex_Dot_Plot.png", p89, width = 8, height = 6, bg = "white")
+    
+    cat("✓ Sex dot plot created\n")
+  } else {
+    cat("⚠ No significant sex-stratified pathways\n")
+  }
+  
+  # ============================================================================
+  # PLOT 2: FUEL TYPE DOT PLOT
+  # ============================================================================
+  
+  if (nrow(fueltype_df_relevant_subset) > 0) {
+    p90 <- ggplot(fueltype_df_relevant_subset, 
+                  aes(x = sample_name, y = clean_path, size = abs(NES), color = NES)) + 
+      geom_point() + 
+      scale_size_continuous(range = c(2, 10), limits = c(1, 2.4)) +
+      scale_color_gradient2(
+        low = "blue", mid = "white", high = "red", midpoint = 0,
+        limits = c(-2.3, 2.3),
+        name = "NES"
+      ) + 
+      theme_minimal() + 
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+        axis.text.y = element_text(face = "bold"),
+        axis.title.x = element_text(face = "bold"),
+        axis.title.y = element_text(face = "bold"),
+        plot.title = element_text(face = "bold"),
+        legend.title = element_text(face = "bold"),
+        legend.text = element_text(face = "bold"),
+        legend.key = element_rect(fill = "white"),
+        panel.grid.major = element_line(color = "black"),
+        panel.grid.minor = element_line(color = "black")
+      ) + 
+      labs(
+        title = "GSEA Results by Fuel Type",
+        x = "Fuel Type",
+        y = "Pathway",
+        size = "Absolute NES",
+        color = "NES"
+      ) + 
+      guides(color = guide_colorbar(title = "NES", title.position = "top"))
+    
+    print(p90)
+    save_plot("Fuel_Dot_Plot.png", p90, width = 8, height = 5, bg = "white")
+    
+    cat("✓ Fuel dot plot created\n")
+  } else {
+    cat("⚠ No significant fuel type pathways\n")
+  }
+  
+  cat("\n=== DOT PLOT SUMMARY ===\n")
+  cat("  Sex pathways:", nrow(sex_df_relevant_subset), "\n")
+  cat("  Fuel pathways:", nrow(fueltype_df_relevant_subset), "\n")
+}
+```
+
+---
+
+# Session Information
+
+```{r session-info}
+cat("\n")
+cat("═══════════════════════════════════════════════════════════\n")
+cat("  RNA-SEQ ANALYSIS COMPLETE\n")
+cat("═══════════════════════════════════════════════════════════\n\n")
+
+cat("Output files saved to:\n")
+cat("  Processed data:", here::here(PATH_DATA_PROCESSED), "\n")
+cat("  Figures:", here::here(PATH_OUTPUT_FIGURES), "\n")
+cat("  Tables:", here::here(PATH_OUTPUT_TABLES), "\n\n")
+
+sessionInfo()
+```
