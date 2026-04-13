@@ -87,16 +87,13 @@ prepare_metadata_seq <- function(metadata_full, sample_ids) {
 #'
 #' @return Data frame with DEG_Status column
 #'
-classify_degs <- function(data, fc_cutoff = 1.0, p_cutoff = 0.05) {
-  
-  data <- data %>%
-    mutate(DEG_Status = case_when(
-      padj < p_cutoff & log2FoldChange > fc_cutoff ~ "UP",
-      padj < p_cutoff & log2FoldChange < -fc_cutoff ~ "DOWN",
+classify_degs <- function(data, fc_cutoff = LOG2FC_CUTOFF, p_cutoff = ADJ_P_CUTOFF) {
+  data %>%
+    mutate(DEG = case_when(
+      adj.P.Val <= p_cutoff & log2FC >=  fc_cutoff ~ "UP",
+      adj.P.Val <= p_cutoff & log2FC <= -fc_cutoff ~ "DOWN",
       TRUE ~ "NO"
     ))
-  
-  return(data)
 }
 
 # ============================================================================
