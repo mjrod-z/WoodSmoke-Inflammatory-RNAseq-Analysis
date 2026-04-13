@@ -213,7 +213,7 @@ cat("✓ Dendrogram analysis complete\n")
 
 ## Normalize Counts
 
-```{r normalize-counts, cache=TRUE}
+```{r normalize-counts, cache=FALSE}
 # Median-of-ratios normalization
 counts_matrix <- as.matrix(mjr_seq_filtered[, -1]) + 1  # Add pseudocount
 
@@ -294,7 +294,7 @@ cat("  - Samples:", ncol(counts_for_deg), "\n")
 
 ## DREAM Analysis: Exposure Effects
 
-```{r deg-exposure, eval=TRUE, cache=TRUE}
+```{r deg-exposure, eval=TRUE, cache=FALSE}
 # ============================================================================
 # EXPOSURE EFFECTS (NO SEX INTERACTION)
 # ============================================================================
@@ -360,7 +360,7 @@ cat("✓ DREAM exposure analysis complete\n")
 
 ## DREAM Analysis: Sex × Exposure Interaction
 
-```{r deg-sex-exposure, eval=TRUE, cache=TRUE}
+```{r deg-sex-exposure, eval=TRUE, cache=FALSE}
 # ============================================================================
 # SEX × EXPOSURE INTERACTION
 # ============================================================================
@@ -509,9 +509,9 @@ if (exists("combined_degs")) {
   combined_degs <- combined_degs %>%
     mutate(
       DEG = case_when(
-        log2FC >= LOG2FC_CUTOFF & adj.P.Val < ADJ_P_CUTOFF ~ "UP",
-        log2FC <= -LOG2FC_CUTOFF & adj.P.Val < ADJ_P_CUTOFF ~ "DOWN",
-        TRUE ~ "NO"
+      adj.P.Val <= ADJ_P_CUTOFF & log2FC >=  LOG2FC_CUTOFF ~ "UP",
+      adj.P.Val <= ADJ_P_CUTOFF & log2FC <= -LOG2FC_CUTOFF ~ "DOWN",
+      TRUE ~ "NO"
       )
     )
   
@@ -828,6 +828,171 @@ if (exists("combined_degs")) {
 ```
 
 
+# ── Dose-response scatter: low (5) vs high (25) µg/cm² ──────────────────────
+```{r dose-response-scatter, fig.width=16, fig.height=5}
+
+if (exists("combined_degs")) {
+
+  key_genes <- c("IL1A", "IL1B", "SPDEF", "SRXN1", "CYP1A1", "TXNRD1",
+                 "TNFA", "CXCL8", "SOX9", "HIC1")
+
+  # All samples (exposure-only contrasts)
+  p_dose_all <- plot_dose_response_scatter(
+    combined_degs  = combined_degs,
+    key_genes      = key_genes,
+    sex_filter     = "All",
+    fc_limit       = 8
+  )
+  print(p_dose_all)
+  save_plot("dose_response_scatter_all.png", p_dose_all, width = 16, height = 5)
+
+  # Male only
+  p_dose_male <- plot_dose_response_scatter(
+    combined_degs  = combined_degs,
+    key_genes      = key_genes,
+    sex_filter     = "Male",
+    fc_limit       = 8
+  )
+  print(p_dose_male)
+  save_plot("dose_response_scatter_male.png", p_dose_male, width = 16, height = 5)
+
+  # Female only
+  p_dose_female <- plot_dose_response_scatter(
+    combined_degs  = combined_degs,
+    key_genes      = key_genes,
+    sex_filter     = "Female",
+    fc_limit       = 8
+  )
+  print(p_dose_female)
+  save_plot("dose_response_scatter_female.png", p_dose_female, width = 16, height = 5)
+
+}
+```
+```{r dose-response-table}
+
+if (exists("combined_degs")) {
+
+  # Helper to build the wide data frame for any sex group
+  build_dose_wide <- function(combined_degs, sex_filter = "All") {
+
+    # Coerce
+    df <- as.data.frame(combined_degs)
+    df$log2FC      <- as.numeric(df$log2FC)
+    df$adj.P.Val   <- as.numeric(df$adj.P.Val)
+    df$DEG         <- as.character(df$DEG)
+    df$X           <- as.character(df$X)
+    df$file_name   <- as.character(df$file_name)
+    df$sample_name <- as.character(df$sample_name)
+    if (!"Sex" %in% names(df)) df$Sex <- NA_character_
+    df$Sex <- as.character(df$Sex)
+
+    # Filter sex
+    df <- if (sex_filter == "All") {
+      df[is.na(df$Sex), ]
+    } else {
+      df[!is.na(df$Sex) & df$Sex == sex_filter, ]
+    }
+
+    # Tag fuel, keep vs-PBS only
+    df <- df[grepl("_vs_PBS", df$file_name), ]
+    df$fuel <- dplyr::case_when(
+      grepl("^Peat", df$sample_name) ~ "Peat",
+      grepl("^Euc",  df$sample_name) ~ "Eucalyptus",
+      grepl("^Pine", df$sample_name) ~ "Pine",
+      grepl("^RO",   df$sample_name) ~ "Red Oak",
+      TRUE ~ df$sample_name
+    )
+
+    # Low dose
+    low <- df[grepl("^(Peat|Euc|Pine|RO)5_", df$file_name),
+              c("X", "fuel", "log2FC", "adj.P.Val", "DEG")] %>%
+      dplyr::rename(fc_low = log2FC, padj_low = adj.P.Val, deg_low = DEG) %>%
+      dplyr::distinct(X, fuel, .keep_all = TRUE)
+
+    # High dose
+    high <- df[grepl("^(Peat|Euc|Pine|RO)25_", df$file_name),
+               c("X", "fuel", "log2FC", "adj.P.Val", "DEG")] %>%
+      dplyr::rename(fc_high = log2FC, padj_high = adj.P.Val, deg_high = DEG) %>%
+      dplyr::distinct(X, fuel, .keep_all = TRUE)
+
+    dplyr::inner_join(low, high, by = c("X", "fuel")) %>%
+      dplyr::mutate(group = sex_filter)
+  }
+
+  # Build for all three groups
+  wide_all    <- build_dose_wide(combined_degs, "All")
+  wide_male   <- build_dose_wide(combined_degs, "Male")
+  wide_female <- build_dose_wide(combined_degs, "Female")
+
+  # Combine
+  wide_combined <- dplyr::bind_rows(wide_all, wide_male, wide_female)
+
+  # ── Classify concentration-responsiveness ──────────────────────────────────
+  dose_response_table <- wide_combined %>%
+    dplyr::mutate(
+      # Does the gene change significantly at EITHER dose?
+      sig_low  = padj_low  <= ADJ_P_CUTOFF & abs(fc_low)  >= LOG2FC_CUTOFF,
+      sig_high = padj_high <= ADJ_P_CUTOFF & abs(fc_high) >= LOG2FC_CUTOFF,
+
+      # Is it more extreme at high dose (same direction)?
+      same_direction    = sign(fc_low) == sign(fc_high),
+      conc_responsive   = same_direction & abs(fc_high) > abs(fc_low),
+      fc_change         = round(fc_high - fc_low, 3),   # how much MORE at high dose
+      
+      # Classify the response pattern
+       response_pattern = dplyr::case_when(
+
+        # Significant at BOTH doses, same direction, stronger at high
+        sig_high & sig_low & same_direction & conc_responsive
+          ~ "Amplified (sig both doses)",
+
+        # Significant at BOTH doses, same direction, weaker at high
+        sig_high & sig_low & same_direction & !conc_responsive
+          ~ "Attenuated at high dose",
+
+        # Significant at BOTH doses but flips direction → only meaningful if sig at low
+        sig_high & sig_low & !same_direction
+          ~ "Direction switch",
+
+        # Significant only at high dose (regardless of whether fc_high > fc_low)
+        sig_high & !sig_low
+          ~ "Emergent at high dose",
+
+        # Significant only at low dose
+        sig_low & !sig_high
+          ~ "Lost at high dose",
+
+        TRUE ~ "Not significant at either dose"
+      )
+    ) %>%
+    dplyr::filter(sig_low | sig_high) %>%   # keep only genes sig at ≥1 dose
+    dplyr::select(
+      Gene         = X,
+      Fuel         = fuel,
+      Group        = group,
+      fc_low, padj_low, deg_low,
+      fc_high, padj_high, deg_high,
+      fc_change,
+      response_pattern
+    ) %>%
+    dplyr::arrange(response_pattern, Fuel, dplyr::desc(abs(fc_change)))
+
+  # Print summary counts
+  cat("=== Concentration-Response Summary ===\n")
+  print(table(dose_response_table$response_pattern, dose_response_table$Group))
+
+  cat("\n=== Top concentration-responsive genes (All, amplified) ===\n")
+  dose_response_table %>%
+    dplyr::filter(Group == "All", response_pattern %in% c("Amplified (sig both)", "Emergent at high dose")) %>%
+    dplyr::arrange(dplyr::desc(abs(fc_change))) %>%
+    head(20) %>%
+    print()
+
+  # Save full table
+  save_table(dose_response_table, "dose_response_gene_table.csv")
+  cat("\n✓ Full table saved to output/tables/dose_response_gene_table.csv\n")
+}
+```
 ## UpSet Plots: DEG Overlap
 
 ```{r upset-plots, fig.width=12, fig.height=8}
