@@ -332,14 +332,174 @@ plot_upset_degs <- function(data, title = "DEG Overlap", fuel_colors = NULL) {
   return(p)
 }
 
-#' Create barplot of gene expression by exposure and sex
+#' Scatter plot of gene log2FC at low vs high dose (concentration-response)
 #'
-#' @param vst_data VST-transformed count data with Geneid column
-#' @param metadata Metadata with SAMPLEID, EXPOSURE, SEX, PATIENTCODE
-#' @param genes Vector of gene names to plot
+#' Plots log2FC at low dose (5 µg/cm²) on X vs high dose (25 µg/cm²) on Y,
+#' per gene per fuel type. Points above the diagonal indicate greater response
+#' at high dose (concentration-responsive genes). Key genes are labeled.
+#'
+#' @param combined_degs Combined DEG results data frame from DREAM analysis.
+#'   Must contain: log2FC, adj.P.Val, DEG, X (gene name), sample_name,
+#'   file_name, Sex (NA for exposure-only contrasts).
+#' @param key_genes Character vector of gene names to label on the plot.
+#' @param sex_filter One of "All", "Male", or "Female".
+#' @param fc_limit Symmetric axis limits for log2FC (default 8).
+#' @param label_sig_only If TRUE, only label key_genes significant at high dose.
 #'
 #' @return ggplot object
 #'
+plot_dose_response_scatter <- function(combined_degs,
+                                       key_genes       = NULL,
+                                       sex_filter      = "All",
+                                       fc_limit        = 8,
+                                       label_sig_only  = FALSE) {
+  require(ggplot2)
+  require(ggrepel)
+  require(dplyr)
+  
+  # ── 0. Coerce any list-columns to atomic before anything else ──────────────
+  combined_degs <- as.data.frame(combined_degs)           # drop tbl_df/Bioc classes
+  combined_degs$log2FC    <- as.numeric(combined_degs$log2FC)
+  combined_degs$adj.P.Val <- as.numeric(combined_degs$adj.P.Val)
+  combined_degs$DEG       <- as.character(combined_degs$DEG)
+  combined_degs$X         <- as.character(combined_degs$X)
+  combined_degs$file_name <- as.character(combined_degs$file_name)
+  combined_degs$sample_name <- as.character(combined_degs$sample_name)
+  
+  # Sex column: coerce safely (may be NA or character)
+  if ("Sex" %in% names(combined_degs)) {
+    combined_degs$Sex <- as.character(combined_degs$Sex)
+  } else {
+    combined_degs$Sex <- NA_character_
+  }
+  
+  # ── 1. Filter by sex ───────────────────────────────────────────────────────
+  base_data <- if (sex_filter == "All") {
+    combined_degs[is.na(combined_degs$Sex), ]
+  } else {
+    combined_degs[!is.na(combined_degs$Sex) & combined_degs$Sex == sex_filter, ]
+  }
+  
+  # ── 2. Keep vs-PBS contrasts and tag fuel ─────────────────────────────────
+  base_data <- base_data[grepl("_vs_PBS", base_data$file_name), ]
+  
+  base_data$fuel <- dplyr::case_when(
+    grepl("^Peat", base_data$sample_name) ~ "Peat",
+    grepl("^Euc",  base_data$sample_name) ~ "Eucalyptus",
+    grepl("^Pine", base_data$sample_name) ~ "Pine",
+    grepl("^RO",   base_data$sample_name) ~ "Red Oak",
+    TRUE ~ base_data$sample_name
+  )
+  
+  # ── 3. Split low and high dose, coerce columns, deduplicate ───────────────
+  low_raw <- base_data[grepl("^(Peat|Euc|Pine|RO)5_", base_data$file_name), 
+                       c("X", "fuel", "log2FC", "adj.P.Val", "DEG")]
+  low_raw$log2FC    <- as.numeric(low_raw$log2FC)
+  low_raw$adj.P.Val <- as.numeric(low_raw$adj.P.Val)
+  low_raw$DEG       <- as.character(low_raw$DEG)
+  
+  low_data <- low_raw %>%
+    dplyr::rename(fc_low = log2FC, padj_low = adj.P.Val, deg_low = DEG) %>%
+    dplyr::distinct(X, fuel, .keep_all = TRUE)   # deduplicate without slice
+  
+  high_raw <- base_data[grepl("^(Peat|Euc|Pine|RO)25_", base_data$file_name),
+                        c("X", "fuel", "log2FC", "adj.P.Val", "DEG")]
+  high_raw$log2FC    <- as.numeric(high_raw$log2FC)
+  high_raw$adj.P.Val <- as.numeric(high_raw$adj.P.Val)
+  high_raw$DEG       <- as.character(high_raw$DEG)
+  
+  high_data <- high_raw %>%
+    dplyr::rename(fc_high = log2FC, padj_high = adj.P.Val, deg_high = DEG) %>%
+    dplyr::distinct(X, fuel, .keep_all = TRUE)
+  
+  # ── 4. Join ────────────────────────────────────────────────────────────────
+  wide_data <- dplyr::inner_join(low_data, high_data, by = c("X", "fuel")) %>%
+    dplyr::filter(!is.na(fc_low), !is.na(fc_high)) %>%
+    dplyr::mutate(
+      deg_high   = factor(deg_high, levels = c("UP", "DOWN", "NO")),
+      is_key     = if (!is.null(key_genes)) X %in% key_genes else FALSE,
+      show_label = dplyr::case_when(
+        is_key & label_sig_only & padj_high <= ADJ_P_CUTOFF ~ TRUE,
+        is_key & !label_sig_only                   ~ TRUE,
+        TRUE                                        ~ FALSE
+      ),
+      fuel = factor(fuel, levels = c("Eucalyptus", "Peat", "Pine", "Red Oak"))
+    )
+  
+  cat("✓ Rows in wide_data:", nrow(wide_data), "\n")
+  
+  # ── 5. Colors & title ──────────────────────────────────────────────────────
+  deg_colors <- c("UP" = "#bb0c00", "DOWN" = "#00AFBB", "NO" = "grey75")
+  
+  title_str <- paste0(
+    "Concentration-Response: 5 vs 25 \u00b5g/cm\u00b2",
+    if (sex_filter != "All") paste0("  \u2014  ", sex_filter) else ""
+  )
+  
+  # ── 6. Plot ────────────────────────────────────────────────────────────────
+  p <- ggplot(wide_data, aes(x = fc_low, y = fc_high)) +
+    
+    geom_abline(slope = 1, intercept = 0,
+                linetype = "dashed", color = "gray40", linewidth = 0.5) +
+    geom_hline(yintercept = 0, color = "gray70", linewidth = 0.3) +
+    geom_vline(xintercept = 0, color = "gray70", linewidth = 0.3) +
+    
+    geom_point(aes(color = deg_high), alpha = 0.45, size = 1.4) +
+    
+    geom_point(
+      data  = dplyr::filter(wide_data, is_key),
+      aes(fill = deg_high),
+      color = "black", size = 3.5, shape = 21, stroke = 1.2
+    ) +
+    
+    geom_label_repel(
+      data          = dplyr::filter(wide_data, show_label),
+      aes(label     = X, fill = deg_high),
+      color         = "black",
+      size          = 3,
+      fontface      = "bold",
+      box.padding   = 0.5,
+      max.overlaps  = 30,
+      segment.color = "gray40",
+      show.legend   = FALSE
+    ) +
+    
+    scale_color_manual(
+      values = deg_colors,
+      labels = c("UP"   = "Upregulated (25 \u00b5g/cm\u00b2)",
+                 "DOWN" = "Downregulated (25 \u00b5g/cm\u00b2)",
+                 "NO"   = "Not significant"),
+      name   = "DEG status\n(25 \u00b5g/cm\u00b2)",
+      drop   = FALSE
+    ) +
+    scale_fill_manual(values = deg_colors, guide = "none") +
+    
+    coord_cartesian(xlim = c(-fc_limit, fc_limit),
+                    ylim = c(-fc_limit, fc_limit)) +
+    
+    facet_wrap(~ fuel, nrow = 1) +
+    
+    labs(
+      x     = expression("log"[2] * "FC  (5 \u00b5g/cm\u00b2 vs PBS)"),
+      y     = expression("log"[2] * "FC  (25 \u00b5g/cm\u00b2 vs PBS)"),
+      title = title_str
+    ) +
+    
+    theme_minimal(base_size = 13) +
+    theme(
+      aspect.ratio      = 1,
+      strip.text        = element_text(size = 12, face = "bold"),
+      plot.title        = element_text(hjust = 0.5, size = 14, face = "bold"),
+      panel.border      = element_rect(color = "black", fill = NA, linewidth = 0.5),
+      panel.grid.major  = element_line(color = "gray88"),
+      panel.grid.minor  = element_blank(),
+      plot.background   = element_rect(fill = "#ffffff", color = NA),
+      legend.background = element_rect(fill = "#ffffff", color = NA),
+      legend.position   = "bottom"
+    )
+  
+  return(p)
+}
 plot_gene_expression_bars <- function(vst_data, metadata, genes) {
   require(ggplot2)
   
